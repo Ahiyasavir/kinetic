@@ -50,7 +50,7 @@ import { checkEvidence } from './lib/evidence.mjs';
 import { analyzeState, applyReconciliation, formatReport } from './lib/reconcile.mjs';
 import { governCycle, detectQuotaMode } from './lib/budget-governor.mjs';
 import { getAdapter } from './lib/providers/index.mjs';
-import { resolveModelForRole } from './core/providers.mjs';
+import { resolveModelForRole, getProviderForRole } from './core/providers.mjs';
 import { nonLlmAudit } from './lib/verify.mjs';
 // Intelligence Efficiency Layer (P1–P3) — deterministic helpers layered on top of the existing systems.
 import { compileContext, contextHintBlock } from './lib/context-compiler.mjs';
@@ -316,6 +316,25 @@ const runClaudeSeam = keyRotationActive()
   ? makeRotatingRun({ adapter: getAdapter(config), keyManager, config: { ...config, keyRotation }, logger: log })
   : baseRun;
 
+// PER-ROLE PROVIDER DISPATCH (completes U-42 — activates free local-model offloading via Ollama/LM
+// Studio/vLLM). `invokeRole` calls this single seam with `label` = the role name. Roles that resolve to
+// the DEFAULT provider (config.provider, default 'claude') keep running through runClaudeSeam — which
+// carries the Claude account-pinning + key rotation — so the default config is byte-identical. A role
+// EXPLICITLY mapped to a non-default provider in config.providers.roleMap (e.g. the auditor → a local
+// 'custom' Ollama endpoint) is dispatched to THAT adapter's run() instead. Opt-in: with no providers
+// block, or all roles on the default provider, this is a transparent pass-through (zero behavior change).
+const DEFAULT_PROVIDER_ID = config.provider || 'claude';
+function runClaudeSeamPerRole(opts) {
+  try {
+    const roleAdapter = getProviderForRole(opts.label, config);
+    if (roleAdapter && roleAdapter.id !== DEFAULT_PROVIDER_ID) {
+      log(`  ↳ role "${opts.label}" routed to provider "${roleAdapter.id}" (off-default — local/3rd-party model)`);
+      return roleAdapter.run(opts);
+    }
+  } catch (e) { log(`  per-role provider dispatch fell back to default (${e.message}).`); }
+  return runClaudeSeam(opts);
+}
+
 const core = createCore({
   promptDir: PROMPT_DIR,
   handoffDir: HANDOFF_DIR,
@@ -328,8 +347,9 @@ const core = createCore({
   // Provider-agnostic seam: the active adapter's run() (default Claude) is injected instead of a
   // hardcoded runClaude, so swapping providers = set config.provider + config.models (no core change).
   // The Claude adapter wraps runClaude 1:1; runClaudeSeam adds transparent key rotation when a pool is
-  // configured (else it IS the adapter run — behavior-preserving).
-  runClaude: runClaudeSeam,
+  // configured (else it IS the adapter run — behavior-preserving). runClaudeSeamPerRole adds per-role
+  // provider dispatch on top (off-default roles → their own adapter, e.g. a local Ollama endpoint).
+  runClaude: runClaudeSeamPerRole,
   onUsage: recordUsage, // self-meter tokens/cost for the weekly-budget pacer
   resolveName: contextualName, // context-tag handoff basenames (U-34) so readHandoff matches handoffRel
   validateHandoff: validateOnLoad, // verify schema version + project scope on every handoff read (U-34)

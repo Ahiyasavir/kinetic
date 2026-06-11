@@ -21,16 +21,16 @@
         "_note": "OpenRouter gateway (200+ models). Set OPENROUTER_API_KEY in env. modelId defaults to 'openrouter/auto' (best available) — override with a specific slug like 'anthropic/claude-opus-4'."
       },
       {
-        "name": "custom",
+        "name": "local",
         "type": "custom",
         "baseURL": "",
         "apiKeyEnv": "CUSTOM_LLM_API_KEY",
         "modelId": "",
-        "_note": "Any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, Mistral API…). Set baseURL to your server (e.g. http://localhost:11434) and modelId to your model name. apiKeyEnv is optional for auth-free local servers."
+        "_note": "FREE LOCAL MODELS (Ollama / LM Studio / vLLM / any OpenAI-compatible /chat/completions server). TURN-KEY OLLAMA RECIPE: (1) install Ollama + `ollama pull qwen2.5-coder:7b`; (2) set baseURL='http://localhost:11434/v1' and modelId='qwen2.5-coder:7b'; (3) leave apiKeyEnv (local servers need no key); (4) in roleMap below, point the roles you want offloaded (e.g. 'selector' and/or 'auditor') at 'local'. Those roles then run for $0 on your machine while heavy reasoning (implementer/architect) stays on the cloud model. modelId is shared by every role routed to this provider."
       }
     ],
     "roleMap": {
-      "_comment": "Map each agent role to a provider name from definitions[].name above. Roles not listed fall back to the global config.provider. Example: set 'reviewer' to 'openrouter' to run code review against a cheaper model while keeping the implementer on Anthropic.",
+      "_comment": "Map each agent role to a provider name from definitions[].name above. Roles not listed fall back to the global config.provider. DEFAULT = all on 'anthropic' (full quality, zero local setup). LOCAL-OFFLOAD: change a role to 'local' to run it FREE on Ollama (see the 'local' definition's recipe). SAFEST roles to offload to a weak local model: 'selector' (structured ranking) and the regression 'auditor'; KEEP 'implementer' and 'architect' on the cloud model — that is where reasoning quality matters most. Per-role dispatch is wired in supervisor.mjs (runClaudeSeamPerRole).",
       "implementer": "anthropic",
       "reviewer": "anthropic",
       "selector": "anthropic",
