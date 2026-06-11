@@ -1,0 +1,1 @@
+Refactor: Rename the matchmaking/pairing feature (currently 'זיווג') to a much catchier, stronger, and more engaging name. Ensure the new name is updated consistently across all code, UI screens, components, and bilingual localizations.

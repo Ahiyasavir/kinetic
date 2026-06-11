@@ -1,0 +1,16 @@
+{
+  "_comment": "The NEUTRAL workspace profile — the engine's project-agnostic default. It seeds nothing (the user supplies tasks via the inbox), applies no project-specific rebuild/UI-freeze filtering (the quality gates still apply), and injects no product-specific prompt rules. Any workspace without an explicit profile uses this. RushPoint's content lives in rushpoint.json, NOT here — the engine layer stays generic.",
+  "id": "generic",
+  "label": "Generic workspace",
+  "goalPhases": ["structure", "features", "quality", "continuous"],
+  "metadata": { "domain": "generic", "description": "Project-neutral defaults." },
+  "selectionFilters": {
+    "shippedFeature": "",
+    "polishIntent": "",
+    "uiPolish": "",
+    "hardeningKeep": "",
+    "applyHardeningFreeze": false
+  },
+  "promptProfile": "",
+  "seed": []
+}

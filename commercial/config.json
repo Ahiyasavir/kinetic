@@ -1,0 +1,207 @@
+{
+  "provider": "claude",
+  "profile": "rushpoint",
+  "_profile_comment": "Workspace profile for the DEFAULT workspace (autopilot/profiles/<profile>.json). Holds this project's backlog seed, task selection filters, goal phases, and implementer prompt rules — extracted out of the generic engine. 'rushpoint' preserves the current behavior; 'generic' (or omitting this) gives a project-neutral engine. A named workspace in workspaces.json sets its own `profile`.",
+  "_provider_comment": "Active model provider (autopilot/lib/providers/). 'claude' (default) wraps the Anthropic CLI. Routing/budgeting/verification are provider-neutral (they work in LOGICAL tiers strong|mid|cheap + tokens); swapping to another provider = add an adapter under lib/providers/, register it, set this id, and point config.models at that provider's ids. No core-policy change. For per-role provider routing, see the 'providers' block below.",
+  "model": "claude-opus-4-8",
+  "_providers_comment": "Provider-mapping system (U-42, autopilot/core/providers.mjs). Defines the base set of model providers and maps agent roles to them. All three types are built-in (claude/openrouter/custom) — omitting this block keeps the engine on the single global config.provider ('claude') with zero behavior change. To route a specific role via OpenRouter, set providers.roleMap.reviewer='openrouter' and add your key via apiKeyEnv. See autopilot/docs/PROVIDER_CONFIG.md for full examples.",
+  "providers": {
+    "definitions": [
+      {
+        "name": "anthropic",
+        "type": "claude",
+        "_note": "Anthropic CLI adapter (default). Uses config.cli.bin + config.models for model IDs. No baseURL needed — the CLI handles auth via CLAUDE_CONFIG_DIR or ANTHROPIC_API_KEY."
+      },
+      {
+        "name": "openrouter",
+        "type": "openrouter",
+        "baseURL": "https://openrouter.ai/api/v1",
+        "apiKeyEnv": "OPENROUTER_API_KEY",
+        "modelId": "openrouter/auto",
+        "_note": "OpenRouter gateway (200+ models). Set OPENROUTER_API_KEY in env. modelId defaults to 'openrouter/auto' (best available) — override with a specific slug like 'anthropic/claude-opus-4'."
+      },
+      {
+        "name": "custom",
+        "type": "custom",
+        "baseURL": "",
+        "apiKeyEnv": "CUSTOM_LLM_API_KEY",
+        "modelId": "",
+        "_note": "Any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, Mistral API…). Set baseURL to your server (e.g. http://localhost:11434) and modelId to your model name. apiKeyEnv is optional for auth-free local servers."
+      }
+    ],
+    "roleMap": {
+      "_comment": "Map each agent role to a provider name from definitions[].name above. Roles not listed fall back to the global config.provider. Example: set 'reviewer' to 'openrouter' to run code review against a cheaper model while keeping the implementer on Anthropic.",
+      "implementer": "anthropic",
+      "reviewer": "anthropic",
+      "selector": "anthropic",
+      "auditor": "anthropic",
+      "architect": "anthropic"
+    }
+  },
+  "_architect_comment": "Stage 2 — Architect Mode (autopilot/lib/architect.mjs + core/architect/). A macro-vision prompt (\"Build a real-time chat app from scratch\") is NOT routed to the per-cycle implementer; the Architect invokes the PREMIUM tier (Fable 5 — Mythos-class, superior long-context + multi-step planning) to map the architecture and decompose it into a structured backlog of 20–40 granular sub-tasks with dependencies (parent_task_id + deps). models.architect resolves the 'premium' logical tier; architectMinTasks/architectMaxTasks bound the decomposition; autoTrigger gates whether a detected macro-vision inbox task is decomposed automatically.",
+  "architectModel": "claude-fable-5",
+  "architect": {
+    "enabled": true,
+    "autoTrigger": true,
+    "minTasks": 20,
+    "maxTasks": 40
+  },
+  "_api_pools_comment": "Stage 1 — API key pooling & load balancing (autopilot/lib/key-manager.mjs). DEPRECATES a single global API key: the engine round-robins a POOL of accounts and rotates off any that hit a 429 or exhaust their daily budget, so one rate-limited account no longer stalls the loop. SECRETS NEVER LIVE HERE — each entry names an env var (`key_env`) read at runtime from process.env. Entry shape: { id, provider: 'anthropic'|'openrouter'|'openai', key_env, status: 'active'|'exhausted'|'rate-limited', daily_budget (USD; 0 = uncapped), current_usage (USD), retry_after (null|ISO date) }. Empty array = single pinned-account mode (current behavior). Rotation engages only when an entry's env token is present. See config.json.example for a populated sample.",
+  "api_pools": [],
+  "_keyRotation_comment": "Tuning for the key-rotation wrapper. maxRetries = key rotations per call before surfacing AllKeysExhaustedError (which the supervisor treats as a normal rate-limit cooldown). defaultCooldownMs = fallback cooldown when a 429 carries no retry-after hint. providerMap maps the adapter id (config.provider, e.g. 'claude') to the pool entry `provider` name (e.g. 'anthropic').",
+  "keyRotation": {
+    "enabled": true,
+    "maxRetries": 3,
+    "defaultCooldownMs": 60000,
+    "providerMap": { "claude": "anthropic" }
+  },
+  "models": {
+    "selector": "claude-haiku-4-5",
+    "reviewer": "claude-sonnet-4-6",
+    "auditor": "claude-haiku-4-5",
+    "architect": "claude-fable-5",
+    "implementerHigh": "claude-opus-4-8",
+    "implementerLow": "claude-sonnet-4-6",
+    "implementerLowest": "claude-haiku-4-5"
+  },
+  "implementerRouting": {
+    "opusMinRisk": 3,
+    "opusKeywords": [
+      "security", "firestore.rules", "firestore rules", "data model", "schema", "migration",
+      "scoring", "score formula", "z-score", "matchmaking", "duel", "algorithm",
+      "atomic", "transaction", "custom claim", "auth rules", "money", "payment"
+    ],
+    "_comment": "RISK-AWARE routing (2026-06-05): risk>=opusMinRisk OR an architectural opusKeyword -> Opus; everything else (low-risk polish/UI/reliability) -> Sonnet. Replaced the prior all-Opus alwaysOpusGoals policy that caused ~50 rate-limit pauses."
+  },
+  "scoring": {
+    "weights": { "userImpact": 5, "adminImpact": 3, "reliability": 3, "productRisk": 2, "cleanupValue": 1 },
+    "categoryBonus": {
+      "stations": 12,
+      "builder": 9, "admin": 9, "access": 9, "review": 9,
+      "gameplay": 6, "ui": 6,
+      "social": 3,
+      "reliability": 1, "structure": 0
+    },
+    "minProductShare": 0.7,
+    "minProductTasks": 5,
+    "maxAttemptsBeforeBlock": 3,
+    "maxReviewFailAttempts": 2
+  },
+  "durationDays": 3650,
+  "phase": "hardening",
+  "paths": {
+    "appRoot": ".",
+    "appsDir": "apps",
+    "functionsDir": "functions",
+    "packagesDir": "packages",
+    "scriptsDir": "scripts",
+    "queues": {
+      "inboxDir": "inbox",
+      "stateDir": "state",
+      "handoffDir": "state/handoff",
+      "_comment": "Engine queue/state directory targets (U-31), resolved relative to the autopilot/ dir. inboxDir = where user task files are dropped (the INBOX queue); stateDir = state.json + the backlog/done/blocked markdown mirrors and locks (the BACKLOG/DONE queues live here); handoffDir = the per-role handoff JSON. Defaults match the original hardcoded layout, so leaving these untouched is a no-op. Relocating/onboarding = edit these values only. Consumed via autopilot/config-loader.mjs → { queuePaths }."
+    },
+    "_comment": "Project-agnostic root paths (U-25). appRoot is relative to the autopilot/ parent (the repo root); every other dir is relative to appRoot. Onboarding a new project = edit these values only, no engine code change. Consumed via autopilot/config-loader.mjs → { paths }."
+  },
+  "cli": {
+    "bin": "claude",
+    "outputFormat": "json",
+    "permission": "--dangerously-skip-permissions",
+    "timeoutMs": 1800000,
+    "maxTurnsPerCall": 60
+  },
+  "cycle": {
+    "maxReviseAttempts": 2,
+    "cooldownBetweenCyclesMs": 120000,
+    "backlogTopUpThreshold": 4
+  },
+  "rateLimit": {
+    "baseCooldownMs": 1200000,
+    "maxCooldownMs": 2700000
+  },
+  "taskClasses": {
+    "default": "product",
+    "_comment": "Task taxonomy that drives class-aware selection + review (autopilot/lib/task-class.mjs). Each task is classified product | engine | maintenance | migration by its title prefix (\"architecture: …\") then goal then this map. WHY: the engine's own source lives in the gitignored /autopilot/ tree, so engine/internal work produces NO git diff and can never pass a product-delivery (player-visible-UI) review gate — that contradiction is the deadlock. Classification lets the reviewer apply the RIGHT gate: product → visible-change gate (unchanged); engine/maintenance/migration → on-disk EVIDENCE gate (artifact exists AND is wired). OPTIONAL OVERRIDES: `map` (goal/prefix → class), `policy` (per-class {productGate, evidence, gitDiffRequired, allowGitignored}), `default` (class for unclassifiable tasks; 'product' keeps the strict gate). Omit this whole block to use the built-in DEFAULTS (which preserve today's product-gate behavior and only relax it for clearly engine/internal work).",
+    "map": {},
+    "policy": {}
+  },
+  "budgetGovernor": {
+    "enabled": true,
+    "weeklyTokenQuota": null,
+    "reserveFraction": 0.10,
+    "safetyMargin": 0.15,
+    "retryBuffer": 1.50,
+    "hardStopFraction": 0.95,
+    "downgradeFraction": 0.80,
+    "minCycleTokens": 50000,
+    "safeMode": true,
+    "safeReserveFraction": 0.25,
+    "safeDowngradeFraction": 0.50,
+    "safeHardStopFraction": 0.75,
+    "_safeMode_comment": "P4 — Usage-limit discovery. detectQuotaMode() classifies the spending ceiling as 'known' (explicit weeklyTokenQuota), 'estimated' (only a per-project maxTokensPerCycle cap), or 'unknown' (neither). With safeMode:true the governor NEVER assumes unlimited: an 'estimated' quota uses the tighter safe* fractions (higher reserve, earlier downgrade/stop), and an 'unknown' quota holds a standing DOWNGRADE posture (cheaper models) — it still never STOPS on an unknown quota, so it cannot deadlock. safeMode:false (default) preserves the prior behavior exactly (unknown quota ⇒ always proceed). quotaMode is persisted to state.budget every cycle.",
+    "_comment": "DETERMINISTIC pre-cycle budget gate (autopilot/lib/budget-governor.mjs). Before each cycle a FORMULA (no LLM) decides proceed | downgrade | stop, preventing overspend BEFORE it happens. Q=weeklyTokenQuota (else the per-project cap budgets[project].maxTokensPerCycle, else ∞ → always proceed, backward compatible). S=window tokens spent (state.usage in+out). avg=S/cycles. E=max(minCycleTokens,avg)×(1+safetyMargin)×retryBuffer (conservative, retry-padded). U=Q×(1−reserveFraction) (reserve withheld). P=S+E. Decision: S≥Q×hardStopFraction → STOP (hard quota guard); P>U → STOP (next cycle breaches usable); P>U×downgradeFraction → DOWNGRADE (cheaper models, via lib/route.mjs); else PROCEED. STOP writes the STOP flag (stop early to protect quota; resume after the weekly window resets). Tune thresholds here; enabled:false disables the governor.",
+    "_audit": "Every cycle persists the decision to state.budget {action,reason,spent,quota,usable,projected,estimate,cyclesLeft,fractionUsed,at}. Inspect token-free with: node autopilot/supervisor.mjs verify"
+  },
+  "circuitBreaker": {
+    "enabled": true,
+    "maxConsecutiveFailures": 5,
+    "maxConsecutiveRateLimits": 8,
+    "maxConsecutiveUnproductive": 12,
+    "maxWindowCostUsd": null,
+    "_comment": "Engine safety halt (SaaS hardening). The supervisor runs unattended against a SHARED paid Claude account, so a runaway state must STOP the loop, not burn the account. Trips (writes the STOP flag → watchdog stays down) when ANY threshold is hit: maxConsecutiveFailures back-to-back crash cycles, maxConsecutiveRateLimits back-to-back rate-limit hits, maxConsecutiveUnproductive back-to-back non-merge cycles (churn), or window spend ≥ maxWindowCostUsd (state.usage.costUsd; null = off). A 'merged' cycle clears the streaks. Set any threshold to 0/null to disable that condition; enabled:false disables the breaker entirely (backward compatible). Resume after fixing the cause: `node autopilot/supervisor.mjs reset-breaker`. Consumed by autopilot/lib/circuit-breaker.mjs + supervisor.mjs."
+  },
+  "weeklyBudget": {
+    "enabled": true,
+    "resetAt": "2026-06-10T22:00:00.000Z",
+    "resetIntervalDays": 7,
+    "maxCyclesPerDay": 200,
+    "velocitySensitivity": 1.0,
+    "_comment": "Weekly usage governor (2026-06-05). Account spendora.tracker@gmail.com is SHARED between the kinetic and the user's own Claude sessions, so we pace by cadence (a min gap between cycle starts = 24h/maxCyclesPerDay) to spread consumption evenly to resetAt and leave headroom for the user. The kinetic self-meters its own tokens/cost (state.usage) for visibility; tune maxCyclesPerDay up/down after watching the real burn. Window auto-rolls every resetIntervalDays."
+  },
+  "budgets": {
+    "rushpoint-kinetic-topo": { "maxTokensPerCycle": 80000000, "maxSpendPerEvent": 500 },
+    "_comment": "Per-project token budgets (U-33). Each key is a projectId (the repo+goal slug from lib/lock-manager.mjs resolveRepoGoal — here repo 'Rushpoint-kinetic' + branch suffix 'topo'). maxTokensPerCycle caps that project's cumulative tokens for the current pacing window; maxSpendPerEvent reserves a per-event dollar ceiling for forward use. Counters live in state.tokenSpent[projectId] (lib/token-counter.mjs); the pacer checks them in lib/token-pacer.mjs → isWithinBudget. Two projects each get an independent entry, so one exhausting its budget never throttles another. Omit this whole block to keep cadence-only weekly pacing (backward compatible). Consumed via autopilot/config-loader.mjs → { budgets }."
+  },
+  "validation": {
+    "_comment": "Project-specific validation commands (U-26). These RushPoint commands (typecheck/build-admin/lint/e2e) live here in config.json, NOT in engine code — onboarding a new project = edit this array only, no supervisor/validate change. A failing `required` command fails the cycle; non-required is a non-blocking warning. The `lint` command also feeds the lint-regression guard. Consumed via autopilot/config-loader.mjs → { validation } and autopilot/lib/validate.mjs.",
+    "commands": [
+      { "name": "typecheck", "cmd": "npm run typecheck", "required": true, "timeoutMs": 600000 },
+      { "name": "build-admin", "cmd": "npm run build --workspace=apps/admin", "required": true, "timeoutMs": 600000 },
+      { "name": "lint", "cmd": "npm run lint", "required": false, "timeoutMs": 600000 }
+    ],
+    "lintRegressionGuard": true,
+    "e2e": { "enabled": false, "cmd": "node scripts/e2e-verify.mjs", "timeoutMs": 600000 }
+  },
+  "telemetry": {
+    "enabled": true,
+    "endpoint": null,
+    "batchSize": 50,
+    "flushIntervalMs": 60000,
+    "_comment": "Decoupled engine telemetry (U-36), resolved by autopilot/config-loader.mjs → { telemetry } and consumed by autopilot/lib/telemetry.mjs. Reports the AUTOPILOT ENGINE's own health/metrics (cycle duration, token count, error count, an event log) INDEPENDENTLY of the RushPoint product — supervisor.mjs + watchdog.mjs emit events at startup / cycle-start / cycle-end / on-error. State persists in state.json under framework.telemetry (separate from the app tier). `enabled:false` makes every recorder a no-op (disable without touching supervisor logic); set `endpoint` to a monitoring URL to batch events out, else they buffer locally. Omit this whole block to default to disabled (backward compatible)."
+  },
+  "git": {
+    "integrationBranch": "autopilot/topo",
+    "baseBranch": "topographic-maps",
+    "commitPrefix": "kinetic",
+    "_comment": "Git target (U-35), resolved by autopilot/lib/git-config-loader.mjs → resolveGitConfig(). The engine drives THIS repo/branch. integrationBranch = the branch all reviewed work lands on; baseBranch = where it forks from; commitPrefix = the auto-commit message prefix. THREE OPTIONAL fields make the engine portable to any external repo: `repository` (path to the target repo, relative to the autopilot/ parent or absolute — default '.', the repo the kinetic lives in), `branch` (the active branch — default = integrationBranch), and `worktreeName` (manage the target in a dedicated git worktree placed as a sibling of `repository` — default absent = operate in-place). Omit all three (as here) to keep the current RushPoint in-place layout (fully backward compatible). The watchdog initializes/creates any configured worktree on startup and passes the resolved working-tree root to the supervisor via KINETIC_GIT_ROOT. See autopilot/docs/git-config.md."
+  },
+  "contextProvider": {
+    "enabled": false,
+    "interface": "core/context-provider.mjs#ContextProviderInterface",
+    "source": "",
+    "cacheStrategy": "memory",
+    "validateFreshness": true,
+    "maxStaleMs": 300000,
+    "fallbackToLocal": true,
+    "_comment": "External codebase-context seam (U-37), resolved by autopilot/config-loader.mjs → { contextProvider } and consumed by autopilot/core/context-provider.mjs + core/selector. A host app can pre-compute its own codebase maps (FileIndexMap/SymbolIndexMap/DependencyGraph) and feed them to the selector so it skips redundant local file scanning. REQUIRED fields: `interface` (the contract a provider implements — the module#export the host targets), `source` (an id for the provider/codebase, also the cache key), `cacheStrategy` ('memory' = reuse a loaded bundle while fresh; 'none' = always re-resolve). OPTIONAL fallback fields: `validateFreshness` (reject maps older than maxStaleMs and fall back to local analysis), `maxStaleMs` (freshness window, default 300000 = 5 min), `fallbackToLocal` (silently use local file-system analysis when no/stale/invalid maps — default true; keeps standalone mode working). `enabled:false` (the default) keeps the engine on pure local analysis — fully backward compatible. See autopilot/docs/context-provider.md."
+  },
+  "handoff": {
+    "context": "rushpoint-kinetic-topo",
+    "_comment": "Per-role handoff file context tag (U-34), resolved by autopilot/lib/handoff-paths.mjs. `context` is inserted before the extension of every handoff basename (selection.json -> selection-rushpoint-kinetic-topo.json; same for implementation/review/audit) so two project contexts that share a handoff dir never overwrite each other. Omit `context` to derive it from the repo+goal slug (the same identity used by locks/budgets); omit the whole block (and have no derivable repo/goal) to keep the legacy generic 'selection.json' basenames (backward compatible). See autopilot/HANDOFF_STRUCTURE.md."
+  },
+  "locks": {
+    "watchdog": "{repoGoal}.watchdog.lock",
+    "supervisor": "{repoGoal}.supervisor.lock",
+    "_comment": "Process-lock filenames (U-32), resolved at engine startup by autopilot/lib/lock-manager.mjs. {repoGoal} expands to the active target repo + goal segment (repo dir name + the git.integrationBranch suffix after '/', e.g. 'rushpoint-kinetic-topo') so two kinetic instances against different targets/goals never share a lock. Optionally set locks.repoGoal to override the derived segment. Omit this whole `locks` block for the legacy hardcoded 'watchdog.lock'/'supervisor.lock' basenames (backward compatible — graceful fallback, no breaking change). Consumed via autopilot/lib/lock-manager.mjs → { lockPaths }."
+  }
+}

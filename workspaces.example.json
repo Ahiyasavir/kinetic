@@ -1,0 +1,43 @@
+{
+  "_comment": "Workspace registry for the standalone kinetic. Copy to workspaces.json to enable named multi-workspace selection. The DEFAULT workspace (the engine's config.json-derived target) is ALWAYS available even without this file, so the engine runs standalone with zero registry. Each entry needs only `root`; every other field falls back to a safe engine default (see autopilot/lib/workspace.mjs → workspaceFromEntry). Select one at runtime with: node autopilot/cli.mjs --workspace <id> <command>, or list them with: node autopilot/cli.mjs workspaces. RushPoint is intentionally listed as just ONE entry here — it is not the engine's identity.",
+  "default": null,
+  "workspaces": [
+    {
+      "id": "rushpoint",
+      "label": "RushPoint — Race to Tzion",
+      "root": ".",
+      "branch": "topographic-maps",
+      "integrationBranch": "autopilot/topo",
+      "baseBranch": "topographic-maps",
+      "commitPrefix": "kinetic",
+      "budgetScope": "rushpoint-kinetic-topo",
+      "validation": {
+        "commands": [
+          { "name": "typecheck", "cmd": "npm run typecheck", "required": true, "timeoutMs": 600000 },
+          { "name": "build-admin", "cmd": "npm run build --workspace=apps/admin", "required": true, "timeoutMs": 600000 },
+          { "name": "lint", "cmd": "npm run lint", "required": false, "timeoutMs": 600000 }
+        ],
+        "lintRegressionGuard": true,
+        "e2e": { "enabled": false, "cmd": "node scripts/e2e-verify.mjs", "timeoutMs": 600000 }
+      },
+      "boundaries": { "write": ["."], "read": ["."] }
+    },
+    {
+      "id": "demo-app",
+      "label": "Example second workspace",
+      "root": "../demo-app",
+      "branch": "main",
+      "integrationBranch": "autopilot/demo",
+      "baseBranch": "main",
+      "commitPrefix": "kinetic",
+      "validation": {
+        "commands": [
+          { "name": "typecheck", "cmd": "npm run typecheck", "required": true, "timeoutMs": 600000 }
+        ],
+        "lintRegressionGuard": false,
+        "e2e": { "enabled": false, "cmd": "", "timeoutMs": 600000 }
+      },
+      "boundaries": { "write": ["."], "read": ["."] }
+    }
+  ]
+}

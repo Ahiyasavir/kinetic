@@ -1,0 +1,1 @@
+architecture: sandboxed execution preparation — define and stub the seam that runs each implementation cycle's shell/git/file operations inside an isolated, resource-limited sandbox (no access outside the tenant's worktree), so untrusted tenant repos cannot touch the host. goal: architecture risk: 4

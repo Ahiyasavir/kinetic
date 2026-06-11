@@ -1,0 +1,1 @@
+architecture: multi-tenant isolation — give each tenant/user a fully separated state + config + lock + budget namespace so one tenant's run can never read, write, or throttle another's. goal: architecture risk: 4

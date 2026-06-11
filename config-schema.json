@@ -1,0 +1,231 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Kinetic config.json",
+  "type": "object",
+  "required": [
+    "model",
+    "models",
+    "durationDays",
+    "phase",
+    "paths",
+    "cli",
+    "cycle",
+    "validation",
+    "git"
+  ],
+  "properties": {
+    "model": {
+      "type": "string"
+    },
+    "models": {
+      "type": "object",
+      "required": [
+        "selector",
+        "reviewer",
+        "auditor",
+        "implementerHigh",
+        "implementerLow"
+      ],
+      "properties": {
+        "selector": {
+          "type": "string"
+        },
+        "reviewer": {
+          "type": "string"
+        },
+        "auditor": {
+          "type": "string"
+        },
+        "implementerHigh": {
+          "type": "string"
+        },
+        "implementerLow": {
+          "type": "string"
+        },
+        "architect": {
+          "type": "string"
+        }
+      }
+    },
+    "architectModel": {
+      "type": "string"
+    },
+    "architect": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "autoTrigger": { "type": "boolean" },
+        "minTasks": { "type": "integer" },
+        "maxTasks": { "type": "integer" }
+      }
+    },
+    "durationDays": {
+      "type": "integer"
+    },
+    "phase": {
+      "type": "string"
+    },
+    "paths": {
+      "type": "object",
+      "required": [
+        "appRoot",
+        "queues"
+      ],
+      "properties": {
+        "appRoot": {
+          "type": "string"
+        },
+        "appsDir": {
+          "type": "string"
+        },
+        "functionsDir": {
+          "type": "string"
+        },
+        "packagesDir": {
+          "type": "string"
+        },
+        "scriptsDir": {
+          "type": "string"
+        },
+        "queues": {
+          "type": "object",
+          "required": [
+            "inboxDir",
+            "stateDir",
+            "handoffDir"
+          ],
+          "properties": {
+            "inboxDir": {
+              "type": "string"
+            },
+            "stateDir": {
+              "type": "string"
+            },
+            "handoffDir": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "cli": {
+      "type": "object",
+      "required": [
+        "bin",
+        "outputFormat",
+        "timeoutMs",
+        "maxTurnsPerCall"
+      ],
+      "properties": {
+        "bin": {
+          "type": "string"
+        },
+        "outputFormat": {
+          "type": "string"
+        },
+        "permission": {
+          "type": "string"
+        },
+        "timeoutMs": {
+          "type": "integer"
+        },
+        "maxTurnsPerCall": {
+          "type": "integer"
+        }
+      }
+    },
+    "cycle": {
+      "type": "object",
+      "required": [
+        "maxReviseAttempts",
+        "cooldownBetweenCyclesMs",
+        "backlogTopUpThreshold"
+      ],
+      "properties": {
+        "maxReviseAttempts": {
+          "type": "integer"
+        },
+        "cooldownBetweenCyclesMs": {
+          "type": "integer"
+        },
+        "backlogTopUpThreshold": {
+          "type": "integer"
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "required": [
+        "commands"
+      ],
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "lintRegressionGuard": {
+          "type": "boolean"
+        },
+        "e2e": {
+          "type": "object"
+        }
+      }
+    },
+    "git": {
+      "type": "object",
+      "required": [
+        "integrationBranch",
+        "baseBranch",
+        "commitPrefix"
+      ],
+      "properties": {
+        "integrationBranch": {
+          "type": "string"
+        },
+        "baseBranch": {
+          "type": "string"
+        },
+        "commitPrefix": {
+          "type": "string"
+        }
+      }
+    },
+    "firebase": {
+      "type": "object"
+    },
+    "api_pools": {
+      "type": "array",
+      "description": "Stage 1 key pool. Each entry names an env var holding the token; secrets never live in config.json.",
+      "items": {
+        "type": "object",
+        "required": ["id", "provider", "key_env"],
+        "properties": {
+          "id": { "type": "string" },
+          "provider": { "type": "string", "enum": ["anthropic", "openrouter", "openai"] },
+          "key_env": { "type": "string" },
+          "status": { "type": "string", "enum": ["active", "exhausted", "rate-limited"] },
+          "daily_budget": { "type": "number" },
+          "current_usage": { "type": "number" },
+          "retry_after": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "keyRotation": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "maxRetries": { "type": "integer" },
+        "defaultCooldownMs": { "type": "integer" },
+        "providerMap": { "type": "object" }
+      }
+    },
+    "budgets": {
+      "type": "object"
+    },
+    "telemetry": {
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,1 @@
+intelligence: create a Proactive Scanner agent that runs during queue idle time, analyzing codebase for tech-debt and generating Markdown tickets into autopilot/suggestions/ for user approval goal: intelligence risk: 3

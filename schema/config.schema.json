@@ -1,0 +1,388 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Autopilot config.json",
+  "description": "Strict JSON Schema for autopilot/config.json. Keys prefixed with _ are documentation comments and are always allowed. See docs/CONFIG_SCHEMA.md for field descriptions and annotated examples.",
+  "type": "object",
+  "required": ["model", "models", "durationDays", "phase", "paths", "cli", "cycle", "validation", "git"],
+  "additionalProperties": false,
+  "patternProperties": {
+    "^_": { "description": "Documentation comment — ignored by the engine." }
+  },
+  "properties": {
+    "provider": {
+      "type": "string",
+      "description": "Active model provider id (e.g. 'claude'). Must match a lib/providers/ adapter."
+    },
+    "profile": {
+      "type": "string",
+      "description": "Workspace profile name under autopilot/profiles/. Controls backlog seed, task filters, and goal phases."
+    },
+    "model": {
+      "type": "string",
+      "description": "Default implementer model id (overridden per-cycle by implementerRouting logic)."
+    },
+    "architectModel": {
+      "type": "string",
+      "description": "Model id used by the Architect stage when decomposing a macro-vision task."
+    },
+    "architect": {
+      "type": "object",
+      "description": "Controls the Architect-mode decomposition stage.",
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "autoTrigger": { "type": "boolean", "description": "Auto-decompose detected macro-vision inbox tasks." },
+        "minTasks": { "type": "integer", "minimum": 1, "description": "Minimum sub-tasks the Architect must produce." },
+        "maxTasks": { "type": "integer", "minimum": 1, "description": "Maximum sub-tasks the Architect may produce." }
+      }
+    },
+    "api_pools": {
+      "type": "array",
+      "description": "Stage 1 key pool. Secrets live in env vars, never here.",
+      "items": {
+        "type": "object",
+        "required": ["id", "provider", "key_env"],
+        "additionalProperties": false,
+        "patternProperties": { "^_": {} },
+        "properties": {
+          "id":             { "type": "string", "description": "Unique pool entry identifier." },
+          "provider":       { "type": "string", "enum": ["anthropic", "openrouter", "openai"] },
+          "key_env":        { "type": "string", "description": "Name of the env var holding the API secret." },
+          "status":         { "type": "string", "enum": ["active", "exhausted", "rate-limited"] },
+          "daily_budget":   { "type": "number", "minimum": 0, "description": "Per-day USD cap; 0 = uncapped." },
+          "current_usage":  { "type": "number", "minimum": 0 },
+          "retry_after":    { "type": ["string", "null"], "description": "ISO date after which to retry, or null." }
+        }
+      }
+    },
+    "keyRotation": {
+      "type": "object",
+      "description": "Tuning for the key-rotation wrapper (lib/key-manager.mjs).",
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "enabled":           { "type": "boolean" },
+        "maxRetries":        { "type": "integer", "minimum": 0, "description": "Key rotations per call before surfacing AllKeysExhaustedError." },
+        "defaultCooldownMs": { "type": "integer", "minimum": 0, "description": "Fallback cooldown when a 429 carries no retry-after hint." },
+        "providerMap":       { "type": "object", "additionalProperties": { "type": "string" }, "description": "Maps adapter id to pool provider name (e.g. claude → anthropic)." }
+      }
+    },
+    "models": {
+      "type": "object",
+      "description": "Named model ids for each engine role. implementerLowest is optional.",
+      "required": ["selector", "reviewer", "auditor", "implementerHigh", "implementerLow"],
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "selector":          { "type": "string" },
+        "reviewer":          { "type": "string" },
+        "auditor":           { "type": "string" },
+        "architect":         { "type": "string" },
+        "implementerHigh":   { "type": "string" },
+        "implementerLow":    { "type": "string" },
+        "implementerLowest": { "type": "string" }
+      }
+    },
+    "implementerRouting": {
+      "type": "object",
+      "description": "Risk-aware model routing for the implementer stage.",
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "opusMinRisk":  { "type": "integer", "minimum": 0, "description": "Minimum risk score that routes to the high-tier model." },
+        "opusKeywords": { "type": "array", "items": { "type": "string" }, "description": "Task-title keywords that force the high-tier model regardless of risk." }
+      }
+    },
+    "scoring": {
+      "type": "object",
+      "description": "Scoring weights and category bonuses for task prioritisation.",
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "weights":                { "type": "object", "additionalProperties": { "type": "number" }, "description": "Dimension weights (e.g. userImpact, adminImpact, reliability)." },
+        "categoryBonus":          { "type": "object", "additionalProperties": { "type": "number" }, "description": "Per-category score bonus map." },
+        "minProductShare":        { "type": "number", "minimum": 0, "maximum": 1, "description": "Minimum fraction of selected tasks that must be product-class." },
+        "minProductTasks":        { "type": "integer", "minimum": 0, "description": "Minimum absolute count of product-class tasks in selection." },
+        "maxAttemptsBeforeBlock": { "type": "integer", "minimum": 1, "description": "Attempts before a task is blocked." },
+        "maxReviewFailAttempts":  { "type": "integer", "minimum": 1, "description": "Allowed review failures before a task is escalated." }
+      }
+    },
+    "durationDays": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Total planned project duration in days (controls scheduling horizons)."
+    },
+    "phase": {
+      "type": "string",
+      "description": "Current project phase label (e.g. 'hardening', 'building', 'shipping')."
+    },
+    "paths": {
+      "type": "object",
+      "description": "Project-agnostic root paths. appRoot is relative to the repo root (autopilot/ parent).",
+      "required": ["appRoot"],
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "appRoot":      { "type": "string", "description": "Repo root, relative to the autopilot/ parent directory." },
+        "appsDir":      { "type": "string" },
+        "functionsDir": { "type": "string" },
+        "packagesDir":  { "type": "string" },
+        "scriptsDir":   { "type": "string" },
+        "queues": {
+          "type": "object",
+          "description": "Engine queue/state directory targets, resolved relative to autopilot/.",
+          "additionalProperties": false,
+          "patternProperties": { "^_": {} },
+          "properties": {
+            "inboxDir":  { "type": "string" },
+            "stateDir":  { "type": "string" },
+            "handoffDir":{ "type": "string" }
+          }
+        }
+      }
+    },
+    "cli": {
+      "type": "object",
+      "description": "CLI wrapper configuration for invoking the model provider.",
+      "required": ["bin", "outputFormat", "timeoutMs", "maxTurnsPerCall"],
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "bin":            { "type": "string", "description": "CLI binary name (e.g. 'claude')." },
+        "outputFormat":   { "type": "string", "enum": ["json", "text"] },
+        "permission":     { "type": "string", "description": "Permission flag passed to the CLI (e.g. --dangerously-skip-permissions)." },
+        "timeoutMs":      { "type": "integer", "minimum": 0 },
+        "maxTurnsPerCall":{ "type": "integer", "minimum": 1 }
+      }
+    },
+    "cycle": {
+      "type": "object",
+      "description": "Per-cycle pacing and backlog top-up controls.",
+      "required": ["maxReviseAttempts", "cooldownBetweenCyclesMs", "backlogTopUpThreshold"],
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "maxReviseAttempts":        { "type": "integer", "minimum": 0 },
+        "cooldownBetweenCyclesMs":  { "type": "integer", "minimum": 0 },
+        "backlogTopUpThreshold":    { "type": "integer", "minimum": 0 }
+      }
+    },
+    "rateLimit": {
+      "type": "object",
+      "description": "Exponential back-off bounds for rate-limit handling.",
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "baseCooldownMs": { "type": "integer", "minimum": 0 },
+        "maxCooldownMs":  { "type": "integer", "minimum": 0 }
+      }
+    },
+    "taskClasses": {
+      "type": "object",
+      "description": "Task taxonomy that gates selection and review by product/engine/maintenance/migration class.",
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "default": { "type": "string", "enum": ["product", "engine", "maintenance", "migration"], "description": "Class for tasks that cannot be classified from title/goal." },
+        "map":     { "type": "object", "additionalProperties": { "type": "string" }, "description": "Goal/prefix → class overrides." },
+        "policy":  { "type": "object", "additionalProperties": true, "description": "Per-class gate policy overrides." }
+      }
+    },
+    "budgetGovernor": {
+      "type": "object",
+      "description": "Deterministic pre-cycle budget gate (lib/budget-governor.mjs).",
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "enabled":              { "type": "boolean" },
+        "weeklyTokenQuota":     { "type": ["integer", "null"], "minimum": 0, "description": "Weekly token quota Q; null = derive from per-project cap or ∞." },
+        "reserveFraction":      { "type": "number", "minimum": 0, "maximum": 1 },
+        "safetyMargin":         { "type": "number", "minimum": 0 },
+        "retryBuffer":          { "type": "number", "minimum": 1 },
+        "hardStopFraction":     { "type": "number", "minimum": 0, "maximum": 1 },
+        "downgradeFraction":    { "type": "number", "minimum": 0, "maximum": 1 },
+        "minCycleTokens":       { "type": "integer", "minimum": 0 },
+        "safeMode":             { "type": "boolean", "description": "Engage tighter reserve/downgrade fractions when quota is unknown." },
+        "safeReserveFraction":  { "type": "number", "minimum": 0, "maximum": 1 },
+        "safeDowngradeFraction":{ "type": "number", "minimum": 0, "maximum": 1 },
+        "safeHardStopFraction": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "circuitBreaker": {
+      "type": "object",
+      "description": "Engine safety halt — trips the STOP flag when consecutive failure thresholds are exceeded.",
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "enabled":                     { "type": "boolean" },
+        "maxConsecutiveFailures":       { "type": "integer", "minimum": 0 },
+        "maxConsecutiveRateLimits":     { "type": "integer", "minimum": 0 },
+        "maxConsecutiveUnproductive":   { "type": "integer", "minimum": 0 },
+        "maxWindowCostUsd":             { "type": ["number", "null"], "minimum": 0, "description": "Window spend ceiling in USD; null = disabled." }
+      }
+    },
+    "weeklyBudget": {
+      "type": "object",
+      "description": "Weekly pacing governor — spreads cycle starts evenly to the reset date.",
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "enabled":              { "type": "boolean" },
+        "resetAt":              { "type": "string", "description": "ISO 8601 date-time of the next weekly window reset." },
+        "resetIntervalDays":    { "type": "integer", "minimum": 1 },
+        "maxCyclesPerDay":      { "type": "integer", "minimum": 0 },
+        "velocitySensitivity":  { "type": "number", "minimum": 0 }
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "description": "Per-project token budgets. Keys are projectId slugs (repo+goal); comment keys (^_) are ignored.",
+      "patternProperties": {
+        "^_": { "description": "Documentation comment — ignored." },
+        "^[^_]": {
+          "type": "object",
+          "additionalProperties": false,
+          "patternProperties": { "^_": {} },
+          "properties": {
+            "maxTokensPerCycle": { "type": "number", "minimum": 0, "description": "Cumulative token cap for the current pacing window." },
+            "maxSpendPerEvent":  { "type": "number", "minimum": 0, "description": "Per-event USD ceiling (reserved for forward use)." }
+          }
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "description": "Project-specific validation commands (typecheck, build, lint, e2e). Lives in config, not engine code.",
+      "required": ["commands"],
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "commands": {
+          "type": "array",
+          "description": "Ordered list of validation commands. required:true commands block the cycle on failure.",
+          "items": {
+            "type": "object",
+            "required": ["name", "cmd"],
+            "additionalProperties": false,
+            "patternProperties": { "^_": {} },
+            "properties": {
+              "name":      { "type": "string" },
+              "cmd":       { "type": "string" },
+              "required":  { "type": "boolean" },
+              "timeoutMs": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "lintRegressionGuard": { "type": "boolean", "description": "Fail the cycle when the lint error count increases vs the baseline." },
+        "e2e": {
+          "type": "object",
+          "description": "Optional end-to-end test command.",
+          "additionalProperties": false,
+          "patternProperties": { "^_": {} },
+          "properties": {
+            "enabled":   { "type": "boolean" },
+            "cmd":       { "type": "string" },
+            "timeoutMs": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "description": "Engine health/metrics telemetry (lib/telemetry.mjs). enabled:false = no-op.",
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "enabled":         { "type": "boolean" },
+        "endpoint":        { "type": ["string", "null"], "description": "HTTP endpoint to POST batched events; null = local buffer only." },
+        "batchSize":       { "type": "integer", "minimum": 1 },
+        "flushIntervalMs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "git": {
+      "type": "object",
+      "description": "Git target configuration (lib/git-config-loader.mjs).",
+      "required": ["integrationBranch", "baseBranch", "commitPrefix"],
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "integrationBranch": { "type": "string", "description": "Branch all reviewed work lands on." },
+        "baseBranch":        { "type": "string", "description": "Branch the integration branch forks from." },
+        "commitPrefix":      { "type": "string", "description": "Auto-commit message prefix (e.g. 'kinetic')." },
+        "repository":        { "type": "string", "description": "Optional path to the target repo (default '.' = the repo the kinetic lives in)." },
+        "branch":            { "type": "string", "description": "Optional active branch override." },
+        "worktreeName":      { "type": "string", "description": "Optional git worktree name for isolated target-repo management." }
+      }
+    },
+    "providers": {
+      "type": "object",
+      "description": "Provider-mapping system (U-42, core/providers.mjs). Defines the base set of model providers and maps agent roles to them. Omitting this block keeps the engine on the single global config.provider with no behavior change.",
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "definitions": {
+          "type": "array",
+          "description": "List of provider definitions. Each entry describes a named provider (anthropic/openrouter/custom) with its connection details.",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "additionalProperties": false,
+            "patternProperties": { "^_": {} },
+            "properties": {
+              "name":      { "type": "string", "description": "Unique provider name referenced by roleMap." },
+              "type":      { "type": "string", "enum": ["claude", "openrouter", "custom"], "description": "Adapter type — defaults to name if omitted." },
+              "baseURL":   { "type": "string", "description": "HTTP endpoint base URL (required for openrouter/custom; ignored by claude)." },
+              "apiKeyEnv": { "type": "string", "description": "Name of the env var holding the API key. Secret never lives in config.json." },
+              "modelId":   { "type": "string", "description": "Explicit model ID for this provider, overriding tier-based resolution." },
+              "default":   { "type": "boolean", "description": "Mark this provider as the fallback when a role has no roleMap entry." }
+            }
+          }
+        },
+        "roleMap": {
+          "type": "object",
+          "description": "Maps agent role names to provider definition names. Roles absent from this map use the global config.provider.",
+          "patternProperties": {
+            "^_": { "description": "Documentation comment — ignored." },
+            "^[^_]": { "type": "string", "description": "Provider name from definitions[].name." }
+          }
+        }
+      }
+    },
+    "contextProvider": {
+      "type": "object",
+      "description": "External codebase-context seam (core/context-provider.mjs). enabled:false = local analysis only.",
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "enabled":            { "type": "boolean" },
+        "interface":          { "type": "string", "description": "Contract module#export the host targets." },
+        "source":             { "type": "string", "description": "Provider/codebase id and cache key." },
+        "cacheStrategy":      { "type": "string", "enum": ["memory", "none"] },
+        "validateFreshness":  { "type": "boolean" },
+        "maxStaleMs":         { "type": "integer", "minimum": 0 },
+        "fallbackToLocal":    { "type": "boolean" }
+      }
+    },
+    "handoff": {
+      "type": "object",
+      "description": "Per-role handoff file context tag (lib/handoff-paths.mjs).",
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "context": { "type": "string", "description": "Tag inserted into handoff filenames to isolate concurrent project contexts." }
+      }
+    },
+    "locks": {
+      "type": "object",
+      "description": "Process-lock filenames (lib/lock-manager.mjs). {repoGoal} is expanded at runtime.",
+      "additionalProperties": false,
+      "patternProperties": { "^_": {} },
+      "properties": {
+        "watchdog":  { "type": "string" },
+        "supervisor":{ "type": "string" },
+        "repoGoal":  { "type": "string", "description": "Optional override for the derived repo+goal segment." }
+      }
+    }
+  }
+}

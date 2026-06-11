@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Kinetic — Control Center</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a; --txt:#e6e9ef; --dim:#9aa3b2;
+    --accent:#5b8cff; --ok:#3ecf8e; --warn:#ffb020; --bad:#ff5d5d; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt); }
+  header { display:flex; align-items:center; gap:12px; padding:12px 18px; background:var(--panel); border-bottom:1px solid var(--line); position:sticky; top:0; }
+  header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.3px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--dim); }
+  .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); }
+  select, input, button, textarea { font:inherit; color:var(--txt); background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  button { cursor:pointer; } button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.warn { border-color:var(--warn); color:var(--warn); } button.bad { border-color:var(--bad); color:var(--bad); }
+  main { display:grid; grid-template-columns:1fr 1fr; gap:14px; padding:14px 18px; max-width:1100px; margin:0 auto; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.8px; color:var(--dim); margin:0 0 10px; }
+  .card.full { grid-column:1 / -1; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .kv { display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px solid var(--line); }
+  .kv:last-child { border:0; } .kv .k { color:var(--dim); }
+  .pill { padding:2px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); }
+  .pill.ok { color:var(--ok); border-color:var(--ok); } .pill.warn { color:var(--warn); border-color:var(--warn); } .pill.bad { color:var(--bad); border-color:var(--bad); }
+  .list { max-height:260px; overflow:auto; } .list .item { padding:6px 0; border-bottom:1px solid var(--line); }
+  .list .item small { color:var(--dim); }
+  textarea { width:100%; min-height:60px; resize:vertical; }
+  .muted { color:var(--dim); } .mono { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; }
+  .bar { height:8px; background:var(--panel2); border-radius:6px; overflow:hidden; } .bar > span { display:block; height:100%; background:var(--accent); }
+  .toast { position:fixed; bottom:16px; right:16px; background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:10px 14px; opacity:0; transition:.2s; }
+  .toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="health"></span>
+  <h1>Kinetic · Control Center</h1>
+  <span class="muted mono" id="version"></span>
+  <span style="flex:1"></span>
+  <label class="muted">Workspace</label>
+  <select id="wsPicker"></select>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Status</h2>
+    <div id="statusBody" class="muted">Select a workspace…</div>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" id="btnStart">▶ Start</button>
+      <button class="warn" id="btnPause">⏸ Pause</button>
+      <button class="bad" id="btnResume">⟳ Resume</button>
+    </div>
+    <p class="muted mono" style="margin:8px 0 0">Pause raises the STOP flag (graceful, at the next cycle boundary). Resume clears it.</p>
+  </section>
+
+  <section class="card">
+    <h2>Budget / Usage</h2>
+    <div id="budgetBody" class="muted">—</div>
+  </section>
+
+  <section class="card">
+    <h2>Give it a task</h2>
+    <textarea id="taskText" placeholder="Describe a task for the selected workspace…&#10;(optional front-matter: goal: ui   risk: 2)"></textarea>
+    <div class="row" style="margin-top:8px"><button class="primary" id="btnAddTask">＋ Add to inbox</button>
+      <span class="muted">It becomes a high-priority user task next cycle.</span></div>
+  </section>
+
+  <section class="card">
+    <h2>Queues</h2>
+    <div id="queuesBody" class="muted">—</div>
+  </section>
+
+  <section class="card full">
+    <h2>Backlog</h2>
+    <div id="backlogList" class="list muted">—</div>
+  </section>
+
+  <section class="card full">
+    <h2>Recent activity</h2>
+    <div id="activityList" class="list muted mono">—</div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let WS = null;        // selected workspace id
+let timer = null;
+
+async function jget(p) { const r = await fetch(p); if (!r.ok) throw new Error((await r.json()).error || r.status); return r.json(); }
+async function jpost(p, body) { const r = await fetch(p, { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body) }); const d = await r.json(); if (!r.ok) throw new Error(d.error || r.status); return d; }
+function toast(msg) { const t = $('toast'); t.textContent = msg; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 2200); }
+function k(n) { return (n == null) ? '∞' : (Math.abs(n) >= 1000 ? Math.round(n/1000)+'k' : n); }
+
+async function loadHealth() {
+  try { const h = await jget('/api/health'); $('health').className = 'dot ok'; $('version').textContent = 'v'+h.version; }
+  catch { $('health').className = 'dot bad'; }
+}
+
+async function loadWorkspaces() {
+  const d = await jget('/api/workspaces');
+  const sel = $('wsPicker'); sel.innerHTML = '';
+  for (const w of d.workspaces) {
+    const o = document.createElement('option'); o.value = w.id;
+    o.textContent = w.label + (w.isDefault ? ' (default)' : '') + ' — ' + w.id;
+    sel.appendChild(o);
+  }
+  WS = d.workspaces.find(w => w.id === d.defaultId)?.id || d.workspaces[0]?.id || null;
+  sel.value = WS;
+}
+
+function statusPill(s) {
+  if (!s.exists) return '<span class="pill">never run</span>';
+  if (s.breaker?.tripped) return '<span class="pill bad">breaker tripped</span>';
+  if (s.stopRequested) return '<span class="pill warn">stop requested</span>';
+  return '<span class="pill ok">'+(s.status||'idle')+'</span>';
+}
+
+async function refresh() {
+  if (!WS) return;
+  try {
+    const s = await jget('/api/status?ws='+encodeURIComponent(WS));
+    $('statusBody').innerHTML =
+      '<div class="kv"><span class="k">State</span><span>'+statusPill(s)+'</span></div>' +
+      (s.exists ? (
+        '<div class="kv"><span class="k">Cycle</span><span>'+s.cycle+'</span></div>' +
+        '<div class="kv"><span class="k">Phase</span><span>'+(s.goalPhase||'—')+'</span></div>' +
+        '<div class="kv"><span class="k">Profile</span><span>'+(s.workspace.profileId||'—')+'</span></div>' +
+        '<div class="kv"><span class="k">Root</span><span class="mono">'+s.workspace.root+'</span></div>'
+      ) : '<div class="muted">No state yet — run init, or Start.</div>');
+
+    const b = s.budget || {};
+    const usedPct = b.quota && isFinite(b.quota) ? Math.min(100, Math.round((b.spent/b.quota)*100)) : 0;
+    $('budgetBody').innerHTML = s.exists ? (
+      '<div class="kv"><span class="k">Decision</span><span class="pill '+(b.action==='stop'?'bad':b.action==='downgrade'?'warn':'ok')+'">'+(b.action||'—')+'</span></div>' +
+      '<div class="kv"><span class="k">Quota mode</span><span>'+(b.quotaMode||'—')+(b.safeMode?' · SAFE':'')+'</span></div>' +
+      '<div class="kv"><span class="k">Spent / quota</span><span>'+k(b.spent)+' / '+k(b.quota)+' tok</span></div>' +
+      '<div class="kv"><span class="k">Headroom</span><span>~'+(b.cyclesLeft===null?'∞':b.cyclesLeft)+' cycles</span></div>' +
+      '<div class="bar" style="margin-top:8px"><span style="width:'+usedPct+'%"></span></div>'
+    ) : '<span class="muted">—</span>';
+
+    const q = await jget('/api/queues?ws='+encodeURIComponent(WS));
+    $('queuesBody').innerHTML =
+      '<div class="kv"><span class="k">Backlog</span><span>'+q.backlog.length+'</span></div>' +
+      '<div class="kv"><span class="k">Done</span><span>'+q.done.length+'</span></div>' +
+      '<div class="kv"><span class="k">Blocked</span><span>'+q.blocked.length+'</span></div>';
+    $('backlogList').innerHTML = q.backlog.length ? q.backlog.slice(0,40).map(t =>
+      '<div class="item">'+(t.userRequested?'★ ':'')+escapeHtml(t.title||t.id)+' <small>['+(t.goal||'?')+' · risk '+(t.risk??'?')+']</small></div>').join('') : '<span class="muted">empty</span>';
+
+    const a = await jget('/api/activity?ws='+encodeURIComponent(WS)+'&n=25');
+    $('activityList').innerHTML = a.history.length ? a.history.slice().reverse().map(h =>
+      '<div class="item">#'+h.cycle+' · '+escapeHtml(h.outcome||'?')+' · <small>'+escapeHtml(h.title||h.taskId||'')+'</small></div>').join('') : '<span class="muted">no cycles yet</span>';
+  } catch (e) { toast('refresh failed: '+e.message); }
+}
+
+function escapeHtml(s){ return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+$('wsPicker').addEventListener('change', (e) => { WS = e.target.value; refresh(); });
+$('btnStart').addEventListener('click', async () => { try { const d = await jpost('/api/start',{ws:WS}); toast('started (pid '+d.pid+')'); } catch(e){ toast(e.message); } });
+$('btnPause').addEventListener('click', async () => { try { await jpost('/api/stop',{ws:WS}); toast('pause requested'); refresh(); } catch(e){ toast(e.message); } });
+$('btnResume').addEventListener('click', async () => { try { await jpost('/api/resume',{ws:WS}); toast('resumed'); refresh(); } catch(e){ toast(e.message); } });
+$('btnAddTask').addEventListener('click', async () => {
+  const text = $('taskText').value.trim(); if (!text) return toast('enter a task first');
+  try { await jpost('/api/task',{ws:WS, text}); $('taskText').value=''; toast('task added to inbox'); } catch(e){ toast(e.message); }
+});
+
+(async function init(){
+  await loadHealth();
+  try { await loadWorkspaces(); } catch(e){ toast('cannot load workspaces: '+e.message); }
+  await refresh();
+  timer = setInterval(refresh, 4000);
+})();
+</script>
+</body>
+</html>

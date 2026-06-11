@@ -1,0 +1,22 @@
+# Kinetic — engine-only gitignore (the outer RushPoint repo has its own .gitignore)
+
+# Runtime state — changes every cycle, never share
+state/
+
+# Logs — too noisy for collaborators
+run.log
+devlog.log
+install.log
+
+# Lock files — process-local
+*.lock
+
+# Credentials / API keys
+.account/
+
+# Node
+node_modules/
+
+# Compiled / cached outputs
+*.pyc
+__pycache__/

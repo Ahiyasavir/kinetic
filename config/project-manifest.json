@@ -1,0 +1,26 @@
+{
+  "_comment": "Project manifest (U-28) — makes the project's strategic GOALS and lifecycle PHASES configuration-driven instead of hardcoded in the engine. Consumed via autopilot/lib/manifest-loader.mjs, which validates this file, falls back to built-in defaults if it is missing/malformed, and exposes { projectName, description, goals, phases, appId } + a goalPriority() helper that the candidate-ranking layer (lib/score.mjs) uses to prioritize tasks. Onboarding a new project = edit this file only. goals[].priority MUST mirror config.json → scoring.categoryBonus so there is no ranking regression.",
+  "projectName": "RushPoint",
+  "description": "Gamified real-time team-management app powering the 'Race to Tzion' adventure event in Jerusalem.",
+  "appId": "rushpoint-pwa-7daaa",
+  "goals": [
+    { "id": "goal-stations", "title": "Smart station operator tooling", "category": "stations", "priority": 12 },
+    { "id": "goal-builder", "title": "Event builder / config tooling", "category": "builder", "priority": 9 },
+    { "id": "goal-admin", "title": "Admin / control-room tooling", "category": "admin", "priority": 9 },
+    { "id": "goal-access", "title": "Access-code management", "category": "access", "priority": 9 },
+    { "id": "goal-review", "title": "Judge / station review flows", "category": "review", "priority": 9 },
+    { "id": "goal-gameplay", "title": "Player gameplay flow", "category": "gameplay", "priority": 6 },
+    { "id": "goal-ui", "title": "Polished, fast, attractive UI", "category": "ui", "priority": 6 },
+    { "id": "goal-social", "title": "Healthy, fair social sharing", "category": "social", "priority": 3 },
+    { "id": "goal-reliability", "title": "Event-day reliability / hardening", "category": "reliability", "priority": 1 },
+    { "id": "goal-structure", "title": "Project structure / organization", "category": "structure", "priority": 0 }
+  ],
+  "phases": [
+    { "name": "structure", "status": "done" },
+    { "name": "features", "status": "done" },
+    { "name": "ui", "status": "done" },
+    { "name": "social", "status": "done" },
+    { "name": "admin", "status": "active" },
+    { "name": "continuous", "status": "pending" }
+  ]
+}

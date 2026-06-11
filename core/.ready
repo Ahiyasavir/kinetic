@@ -1,0 +1,7 @@
+Strangler-Fig migration milestone: autopilot/core/ is live.
+
+The generic agent workflows (selector / implementer / reviewer / auditor) and the role-invocation
+runtime now live under autopilot/core/, and supervisor.mjs consumes them via createCore({...}) instead
+of defining them inline (U-30). The presence of this file lifts the protect.mjs freeze on
+supervisor.mjs and watchdog.mjs so the live entry-points may import from core/. The per-file
+`node --check` syntax gate still guards every .mjs under autopilot/.

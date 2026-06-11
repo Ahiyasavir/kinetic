@@ -1,0 +1,43 @@
+{
+  "_doc": "Example autopilot config showing the project-agnostic `paths` block (U-25). Copy the `paths` block into config.json and edit the values to onboard a different repo layout. appRoot is resolved relative to the autopilot/ parent (the repo root); appsDir/functionsDir/packagesDir/scriptsDir are resolved relative to appRoot. The loader (autopilot/config-loader.mjs) exports { paths } with both absolute and relative (`paths.rel`) forms. Keys beginning with `_` are documentation only and are ignored by the loader.",
+  "paths": {
+    "appRoot": ".",
+    "appsDir": "apps",
+    "functionsDir": "functions",
+    "packagesDir": "packages",
+    "scriptsDir": "scripts"
+  },
+  "_api_pools_doc": "Stage 1 — API key pooling & load balancing (autopilot/lib/key-manager.mjs). The engine round-robins these accounts and rotates off any that hit a 429 or exhaust their daily budget. SECRETS NEVER LIVE HERE: set the actual token in the named env var (`key_env`), e.g. export CLAUDE_KEY_1=sk-ant-…. `status`/`current_usage`/`retry_after` are runtime fields — seed them as shown. daily_budget is USD (0/omitted = uncapped). Leave api_pools empty in config.json to keep single pinned-account mode.",
+  "api_pools": [
+    { "id": "anthropic-acc-1", "provider": "anthropic", "key_env": "CLAUDE_KEY_1", "status": "active", "daily_budget": 20, "current_usage": 0, "retry_after": null },
+    { "id": "anthropic-acc-2", "provider": "anthropic", "key_env": "CLAUDE_KEY_2", "status": "active", "daily_budget": 20, "current_usage": 0, "retry_after": null },
+    { "id": "openrouter-1", "provider": "openrouter", "key_env": "OPENROUTER_KEY_1", "status": "active", "daily_budget": 10, "current_usage": 0, "retry_after": null }
+  ],
+  "keyRotation": {
+    "enabled": true,
+    "maxRetries": 3,
+    "defaultCooldownMs": 60000,
+    "providerMap": { "claude": "anthropic" }
+  },
+  "_models_doc": "Logical tiers → concrete model ids. The Stage-2 PREMIUM/architect tier is Fable 5 (claude-fable-5) — the Mythos-class model ($10/M in, $50/M out) used as the mastermind for long-context multi-step planning. `architect` (or top-level `architectModel`) resolves the 'premium' tier in lib/providers/claude.mjs.",
+  "models": {
+    "selector": "claude-haiku-4-5",
+    "reviewer": "claude-sonnet-4-6",
+    "auditor": "claude-haiku-4-5",
+    "architect": "claude-fable-5",
+    "implementerHigh": "claude-opus-4-8",
+    "implementerLow": "claude-sonnet-4-6",
+    "implementerLowest": "claude-haiku-4-5"
+  },
+  "_architect_doc": "Stage-2 Architect Mode. A macro-vision prompt is decomposed by Fable 5 into 20–40 dependency-ordered sub-tasks instead of going to the implementer. autoTrigger gates automatic decomposition of detected macro-vision inbox tasks.",
+  "architect": { "enabled": true, "autoTrigger": true, "minTasks": 20, "maxTasks": 40 },
+  "git": {
+    "_doc": "Git target (U-35), resolved by autopilot/lib/git-config-loader.mjs. The first three keys are the existing in-place fields. `repository` / `branch` / `worktreeName` are OPTIONAL and make the engine portable to ANY external repository: set them to point the autopilot at a different repo/branch and (optionally) manage it in a dedicated git worktree. Omit them to keep the in-place layout. See autopilot/docs/git-config.md.",
+    "integrationBranch": "autopilot/topo",
+    "baseBranch": "topographic-maps",
+    "commitPrefix": "autopilot",
+    "repository": "../some-other-repo",
+    "branch": "main",
+    "worktreeName": "autopilot-worktree"
+  }
+}

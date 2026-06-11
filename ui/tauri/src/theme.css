@@ -1,0 +1,127 @@
+/* theme.css — Kinetic dark theme, ported 1:1 from autopilot/ui/public/index.html (the reference
+ * implementation). Class names are kept IDENTICAL to the browser UI so React components map onto
+ * the proven visual language without translation. Do not rename classes here without checking
+ * every consumer — and never edit ui/public/index.html to match this file (it is frozen). */
+
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel2: #1e222b;
+  --line: #2a2f3a;
+  --txt: #e6e9ef;
+  --dim: #9aa3b2;
+  --accent: #5b8cff;
+  --ok: #3ecf8e;
+  --warn: #ffb020;
+  --bad: #ff5d5d;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 14px/1.5 -apple-system, Segoe UI, Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--txt);
+}
+
+/* ── Header chrome (app shell) ── */
+header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 18px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+}
+header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .3px; }
+
+/* ── Health indicator ── */
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--dim); }
+.dot.ok { background: var(--ok); }
+.dot.bad { background: var(--bad); }
+
+/* ── Form controls ── */
+select, input, button, textarea {
+  font: inherit;
+  color: var(--txt);
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.warn { border-color: var(--warn); color: var(--warn); }
+button.bad { border-color: var(--bad); color: var(--bad); }
+textarea { width: 100%; min-height: 60px; resize: vertical; }
+
+/* ── Page grid ── */
+main {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  padding: 14px 18px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+/* ── Card ── */
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px;
+}
+.card h2 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .8px;
+  color: var(--dim);
+  margin: 0 0 10px;
+}
+.card.full { grid-column: 1 / -1; }
+
+/* ── Layout helpers ── */
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+/* ── Key/value rows ── */
+.kv { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px solid var(--line); }
+.kv:last-child { border: 0; }
+.kv .k { color: var(--dim); }
+
+/* ── Status pills ── */
+.pill { padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); }
+.pill.ok { color: var(--ok); border-color: var(--ok); }
+.pill.warn { color: var(--warn); border-color: var(--warn); }
+.pill.bad { color: var(--bad); border-color: var(--bad); }
+
+/* ── Scrollable lists ── */
+.list { max-height: 260px; overflow: auto; }
+.list .item { padding: 6px 0; border-bottom: 1px solid var(--line); }
+.list .item small { color: var(--dim); }
+
+/* ── Text utilities ── */
+.muted { color: var(--dim); }
+.mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+
+/* ── Progress bar ── */
+.bar { height: 8px; background: var(--panel2); border-radius: 6px; overflow: hidden; }
+.bar > span { display: block; height: 100%; background: var(--accent); }
+
+/* ── Toast ── */
+.toast {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 14px;
+  opacity: 0;
+  transition: .2s;
+}
+.toast.show { opacity: 1; }
