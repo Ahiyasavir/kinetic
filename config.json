@@ -71,7 +71,14 @@
       "scoring", "score formula", "z-score", "matchmaking", "duel", "algorithm",
       "atomic", "transaction", "custom claim", "auth rules", "money", "payment"
     ],
-    "_comment": "RISK-AWARE routing (2026-06-05): risk>=opusMinRisk OR an architectural opusKeyword -> Opus; everything else (low-risk polish/UI/reliability) -> Sonnet. Replaced the prior all-Opus alwaysOpusGoals policy that caused ~50 rate-limit pauses."
+    "haikuFirstRevision": true,
+    "_comment": "RISK-AWARE routing (2026-06-05): risk>=opusMinRisk OR an architectural opusKeyword -> Opus; everything else (low-risk polish/UI/reliability) -> Sonnet. Replaced the prior all-Opus alwaysOpusGoals policy that caused ~50 rate-limit pauses. haikuFirstRevision (2026-06-11): when a revision is triggered by a MECHANICAL validation failure (typecheck/lint/build) — not a reviewer logic objection — the FIRST retry is routed to Haiku (cheap+fast; trivial type/import/syntax fixes resolve ≈90% of compile breaks), escalating back to the task's real tier only if Haiku fails. Set false to disable."
+  },
+  "consensusAudit": {
+    "enabled": true,
+    "alwaysClasses": ["product", "migration"],
+    "minRiskToAudit": 3,
+    "_comment": "Conditional regression-audit gate (2026-06-11, autopilot/supervisor.mjs → shouldRunAuditor). The second independent auditor (regression/scope check) runs on EVERY approved cycle by default — valuable but a full extra LLM call. This makes it CONDITIONAL: it always runs for `alwaysClasses` (product/migration), for any task with risk >= minRiskToAudit, and for user-requested tasks; it is SKIPPED for low-risk engine/maintenance work that already cleared the adversarial reviewer + deterministic validation + the on-disk evidence gate — saving one LLM call + its latency on the common low-risk cycle. Set enabled:false to force the auditor to ALWAYS run (the prior behavior)."
   },
   "scoring": {
     "weights": { "userImpact": 5, "adminImpact": 3, "reliability": 3, "productRisk": 2, "cleanupValue": 1 },

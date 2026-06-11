@@ -22,7 +22,7 @@ import {
   nextTaskId, isPastDeadline, nowIso, seedBacklog
 } from './lib/state.mjs';
 import { runClaude, RateLimitError } from './lib/claude.mjs';
-import { pickImplementerModel } from './lib/route.mjs';
+import { pickImplementerModel, pickRevisionModel } from './lib/route.mjs';
 import { rankBacklog, scoreTask, isCleanup, isProduct, productShare, effectiveTaskPriority, loadScoringPlugin } from './lib/score.mjs';
 import { selectablePool } from './lib/priority.mjs';
 import { isMacroVision, buildArchitectVars, normalizeArchitectPlan, applyArchitectPlanToState, ARCHITECT_MIN_TASKS, ARCHITECT_MAX_TASKS } from './lib/architect.mjs';
@@ -405,6 +405,24 @@ async function maybeRunArchitect(state) {
   return res.injected > 0;
 }
 
+// Decide whether the SECOND-reviewer regression audit runs this cycle. It always runs for high-stakes
+// classes (product/migration) and for anything at/above the risk floor; it is SKIPPED only for clearly
+// low-risk engine/maintenance work that already cleared the adversarial reviewer + deterministic
+// validation + the on-disk evidence gate. Fully config-driven (config.consensusAudit); the defaults
+// below preserve safety (audit product/migration + risk ≥ 3) while saving one LLM call on the common
+// low-risk engine/maintenance cycle. Set consensusAudit.enabled:false to force the audit to ALWAYS run.
+function shouldRunAuditor(task, cls, config) {
+  const c = config.consensusAudit || {};
+  if (c.enabled === false) return true;                       // conditional-skip disabled → always audit
+  const alwaysClasses = c.alwaysClasses || ['product', 'migration'];
+  if (alwaysClasses.includes(cls)) return true;               // never skip high-stakes classes
+  const minRiskToAudit = c.minRiskToAudit ?? 3;
+  const risk = task.risk ?? 5;                                // unknown risk → treat as high (audit)
+  if (risk >= minRiskToAudit) return true;
+  if (task.userRequested) return true;                        // user tasks always get the full gate
+  return false;                                               // low-risk engine/maintenance → skip the audit
+}
+
 // ---------- a single improvement cycle ----------
 async function runCycle(state) {
   state.cycle += 1;
@@ -737,8 +755,19 @@ async function runCycle(state) {
     log(`↺ Seeding implementer with prior-cycle failure memory (cycle ${f.cycle}).`);
   }
 
+  // Tracks whether the PREVIOUS iteration's failure was mechanical (failing validation) vs a reviewer
+  // judgement — drives the Haiku-first revision triage on the next attempt.
+  let lastFailureMechanical = false;
   while (attempt <= config.cycle.maxReviseAttempts) {
-    // IMPLEMENT (model chosen by risk/category routing above)
+    // Per-attempt model: the first attempt (and any logic/scope revise) uses the risk/category route.
+    // A FIRST mechanical retry (validation broke: typecheck/lint/build) is triaged to Haiku — cheap+fast
+    // for the trivial type/import/syntax patch it almost always is; we escalate back to `route` if it fails.
+    let attemptModel = route.model;
+    if (attempt >= 1) {
+      const triage = pickRevisionModel(task, config, { attempt, mechanical: lastFailureMechanical, budgetAction: state.budget?.action });
+      if (triage) { attemptModel = triage.model; log(`↳ ${triage.reason}`); }
+    }
+    // IMPLEMENT (model chosen by risk/category routing above, or Haiku-triaged for a mechanical retry)
     impl = await core.runImplementer({
       TASK_JSON: taskJson,
       TASK_CLASS: taskClass,
@@ -747,7 +776,7 @@ async function runCycle(state) {
       CONTEXT_HINT: contextHint,
       PROFILE_RULES: WORKSPACE.profile.promptProfile || '',
       HANDOFF_PATH: handoffRel('implementation.json')
-    }, route.model);
+    }, attemptModel);
 
     // Make sure we're back on the integration branch (the implementer may have switched branches)
     // and capture any uncommitted work it left behind. All commits accumulate on integration and
@@ -806,29 +835,43 @@ async function runCycle(state) {
       // CONSENSUS GATE: a SECOND, independent reviewer audits specifically for regressions, scope
       // creep, and broken existing behavior. We merge ONLY if both the reviewer AND the auditor
       // approve — the single biggest lever for trustworthy autonomous merges.
-      const audit = await core.runAuditor({
-        TASK_JSON: taskJson,
-        TASK_CLASS: taskClass,
-        EVIDENCE: evidence.summary,
-        IMPL_REPORT: JSON.stringify(impl || { summary: 'no handoff' }, null, 2),
-        VALIDATION: validation.summary,
-        INTEGRATION_BRANCH: config.git.integrationBranch,
-        HANDOFF_PATH: handoffRel('audit.json')
-      });
-      const auditVerdict = audit?.verdict;
-      log(`Regression audit verdict: ${auditVerdict || '(none)'}`);
-      // VETO-ON-OBJECTION: the reviewer already approved + validation is green, so we ship UNLESS the
-      // auditor raises an EXPLICIT objection. A missing/garbled auditor handoff (a tooling hiccup, not a
-      // quality signal) must NOT halt all productivity — it falls through to merge on the first review.
-      if (auditVerdict !== 'reject' && auditVerdict !== 'revise') break;   // approve / unclear / missing → ship
-      // Auditor objected → fold its findings into the bounded revision loop.
-      review = { verdict: auditVerdict, reasons: audit?.reasons, requiredFixes: audit?.requiredFixes, riskNotes: audit?.riskNotes };
-      verdict = auditVerdict;
-      if (verdict === 'reject') break;
+      //
+      // CONDITIONAL AUDIT (cost+latency saver): the second audit adds the MOST value on high-stakes
+      // work (product/migration/risky). For low-risk engine/maintenance tasks that ALREADY passed the
+      // adversarial reviewer + deterministic validation + the on-disk evidence gate, the marginal
+      // regression risk is small — so skip the extra LLM call there. Tunable via config.consensusAudit;
+      // defaults keep the full audit for product/migration and anything at/above minRiskToAudit.
+      if (shouldRunAuditor(task, taskClass, config)) {
+        const audit = await core.runAuditor({
+          TASK_JSON: taskJson,
+          TASK_CLASS: taskClass,
+          EVIDENCE: evidence.summary,
+          IMPL_REPORT: JSON.stringify(impl || { summary: 'no handoff' }, null, 2),
+          VALIDATION: validation.summary,
+          INTEGRATION_BRANCH: config.git.integrationBranch,
+          HANDOFF_PATH: handoffRel('audit.json')
+        });
+        const auditVerdict = audit?.verdict;
+        log(`Regression audit verdict: ${auditVerdict || '(none)'}`);
+        // VETO-ON-OBJECTION: the reviewer already approved + validation is green, so we ship UNLESS the
+        // auditor raises an EXPLICIT objection. A missing/garbled auditor handoff (a tooling hiccup, not a
+        // quality signal) must NOT halt all productivity — it falls through to merge on the first review.
+        if (auditVerdict !== 'reject' && auditVerdict !== 'revise') break;   // approve / unclear / missing → ship
+        // Auditor objected → fold its findings into the bounded revision loop.
+        review = { verdict: auditVerdict, reasons: audit?.reasons, requiredFixes: audit?.requiredFixes, riskNotes: audit?.riskNotes };
+        verdict = auditVerdict;
+        if (verdict === 'reject') break;
+      } else {
+        log(`Regression audit SKIPPED (low-risk ${taskClass}, risk ${task.risk ?? '?'}/5 — reviewer + validation + evidence gate sufficient).`);
+        break;   // reviewer approved + validation green + evidence ok → ship
+      }
     } else if (verdict === 'reject') {
       break;
     }
-    // verdict === 'revise' (or audit-driven revise, or approve-but-validation-failed) → bounded retry
+    // verdict === 'revise' (or audit-driven revise, or approve-but-validation-failed) → bounded retry.
+    // MECHANICAL = validation is failing (typecheck/lint/build broke): the next retry is Haiku-triaged.
+    // A reviewer 'revise' with GREEN validation is a logic/scope issue → keep the strong model.
+    lastFailureMechanical = !validation.ok;
     attempt += 1;
     state.stats.revisions += 1;
     if (attempt > config.cycle.maxReviseAttempts) break;
@@ -964,13 +1007,13 @@ async function runCycle(state) {
   }
 
   // FAILURE LEARNING: capture a lesson when the task got blocked, was rolled back (not approved), or
-  // churned through ≥3 revisions — so a future similar task is flagged + de-risked at pre-flight.
+  // churned through ≥2 revisions — so a future similar task is flagged + de-risked at pre-flight.
   {
     const revisionCount = attempt;
     let failureType = null;
     if (task.status === 'blocked') failureType = 'blocked';
     else if (!approved) failureType = 'rollback';
-    else if (revisionCount >= 3) failureType = 'high-revision';
+    else if (revisionCount >= 2) failureType = 'high-revision';
     if (failureType) recordLesson(task, { failureType, revisionCount, impl, validation, review });
   }
 
