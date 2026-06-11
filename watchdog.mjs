@@ -10,7 +10,7 @@
 //   • Stops cleanly the instant you run:  node autopilot/supervisor.mjs stop   (writes a STOP flag).
 //
 // Start it (detached) with autopilot/install-service.ps1, or directly: node autopilot/watchdog.mjs
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, openSync, closeSync, statSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -65,6 +65,24 @@ function releaseWatchdogLock() { try { const l = JSON.parse(readFileSync(WD_LOCK
 // ---- rotate run.log if it grows large (keep one .1 backup) so a multi-day run can't fill the disk ----
 function rotateLogIfBig() {
   try { if (existsSync(LOG) && statSync(LOG).size > 25 * 1024 * 1024) { renameSync(LOG, LOG + '.1'); } } catch {}
+}
+
+// ---- auto-sync the kinetic engine repo to GitHub after each supervisor run ----
+// Commits any engine file changes (supervisor.mjs, lib/*, etc.) and pushes to the
+// kinetic remote so collaborators always see the latest version. No-op when the
+// autopilot/ directory has no .git or no changes.
+function syncKineticRepo() {
+  if (!existsSync(path.join(__dirname, '.git'))) return;
+  try {
+    const status = execFileSync('git', ['-C', __dirname, 'status', '--porcelain'], { encoding: 'utf8' }).trim();
+    if (!status) return;
+    execFileSync('git', ['-C', __dirname, 'add', '-A'], { encoding: 'utf8' });
+    execFileSync('git', ['-C', __dirname, 'commit', '-m', 'engine: auto-sync'], { encoding: 'utf8' });
+    execFileSync('git', ['-C', __dirname, 'push', 'origin', 'main'], { encoding: 'utf8', timeout: 30000 });
+    log('kinetic repo: changes pushed to GitHub.');
+  } catch (e) {
+    log('kinetic repo: sync skipped (non-fatal):', e.message?.split('\n')[0] || e.message);
+  }
 }
 
 async function main() {
@@ -132,6 +150,7 @@ async function main() {
 
     if (existsSync(STOP_FLAG)) { log('STOP flag present after supervisor exit — shutting down.'); break; }
 
+    syncKineticRepo();
     const ranMs = Date.now() - startedAt;
     if (code !== 0) recordEvent('error', { kind: 'supervisor-exit', code, ranMs });
     if (ranMs < 30000) fails++; else fails = 0;       // only "fast" deaths count toward backoff
