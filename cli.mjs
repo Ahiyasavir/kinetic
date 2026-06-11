@@ -47,6 +47,8 @@ export const ROUTES = {
   ui: { script: 'ui/server.mjs', summary: 'Launch the local control-center UI (loopback HTTP) — the desktop product surface' },
   config: { script: 'config-loader.mjs', summary: 'Print the resolved config paths / validation / budgets' },
   workspaces: { inline: true, summary: 'List registered workspaces (the picker for a desktop UI) — see also --workspace <id>' },
+  // Universal workspace provisioner — runs core/init.mjs against a target repo path.
+  provision: { script: 'core/init.mjs', summary: 'Provision a clean autopilot workspace in any git repo (node autopilot/core/init.mjs [path] [--dry-run] [--force])' },
   // Convenience top-level aliases onto the most common supervisor subcommands.
   init: { script: 'supervisor.mjs', prepend: ['init'], summary: 'Seed state/ + starter backlog and set the deadline (= supervisor init)' },
   run: { script: 'supervisor.mjs', prepend: ['run'], summary: 'Start / resume the autonomous loop (= supervisor run)' },

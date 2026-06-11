@@ -1,0 +1,80 @@
+{
+  "_comment": "Bundle distribution manifest (U-44). Declares the two distributable bundle variants — 'core' (open-source) and 'commercial' (full deployment). Consumed by autopilot/lib/bundle-variants.mjs to detect the active variant at runtime and enforce feature-flag availability.",
+  "schemaVersion": "1",
+  "variants": {
+    "core": {
+      "description": "Open-source core bundle — the reusable agent-workflow engine with no project-specific bindings. Distribute or open-source this layer freely.",
+      "include": [
+        "core/**",
+        "lib/**",
+        "shared/**",
+        "plugins/**",
+        "prompts/**",
+        "profiles/generic.json",
+        "templates/**"
+      ],
+      "exclude": [
+        "commercial/**",
+        "profiles/rushpoint.json",
+        "state/**"
+      ],
+      "entrypoint": "supervisor.mjs",
+      "configSource": "config.json (root fallback)"
+    },
+    "commercial": {
+      "description": "Full commercial bundle — core engine plus project-specific bindings in commercial/. Config is read from commercial/config.json (preferred) with root config.json as fallback.",
+      "include": [
+        "core/**",
+        "lib/**",
+        "shared/**",
+        "plugins/**",
+        "prompts/**",
+        "commercial/**",
+        "profiles/**",
+        "templates/**"
+      ],
+      "exclude": [
+        "state/**"
+      ],
+      "entrypoint": "supervisor.mjs",
+      "configSource": "commercial/config.json"
+    }
+  },
+  "featureFlags": {
+    "multiWorkspace": {
+      "availableIn": ["core", "commercial"],
+      "configKey": "workspaces",
+      "description": "Run the engine against multiple workspace targets simultaneously (workspaces.json). Enabled when workspaces.json exists alongside config.json."
+    },
+    "budgetGovernor": {
+      "availableIn": ["core", "commercial"],
+      "configKey": "budgetGovernor.enabled",
+      "description": "Pre-cycle deterministic token-budget gate (lib/budget-governor.mjs). Prevents overspend before it happens. Enable with budgetGovernor.enabled:true in config.json."
+    },
+    "keyPooling": {
+      "availableIn": ["core", "commercial"],
+      "configKey": "api_pools",
+      "description": "API key pool rotation (lib/key-manager.mjs). Round-robins multiple accounts, rotates off rate-limited ones. Enable by populating api_pools[] in config.json."
+    },
+    "architectMode": {
+      "availableIn": ["core", "commercial"],
+      "configKey": "architect.enabled",
+      "description": "Stage-2 Architect Mode — macro-vision prompt decomposition via the premium tier. Enable with architect.enabled:true in config.json."
+    },
+    "contextProvider": {
+      "availableIn": ["core", "commercial"],
+      "configKey": "contextProvider.enabled",
+      "description": "External codebase-context seam (core/context-provider.mjs). Lets a host pre-compute file/symbol/dependency indexes for the selector. Enable with contextProvider.enabled:true and set contextProvider.source."
+    },
+    "providerRouting": {
+      "availableIn": ["core", "commercial"],
+      "configKey": "providers",
+      "description": "Per-role model-provider routing (core/providers.mjs). Route different agent roles to different LLM providers (Anthropic, OpenRouter, custom OpenAI-compatible endpoint). Configure via providers.definitions + providers.roleMap in config.json."
+    },
+    "commercialProfile": {
+      "availableIn": ["commercial"],
+      "configKey": "profile",
+      "description": "Project-specific workspace profile (profiles/<name>.json). Supplies the curated backlog seed, task-selection filters, and implementer prompt conventions for a commercial deployment. Set config.json → profile to a profile name in profiles/."
+    }
+  }
+}

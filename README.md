@@ -86,6 +86,9 @@ autopilot/
 ├── plugins/             ← REUSABLE EXTENSION MODULES (open-sourceable)
 │   └── (add custom provider/context/scoring adapters here)
 │
+├── templates/           ← EXAMPLE CONFIGURATIONS (open-sourceable; copy to commercial/ to onboard)
+│   └── typescript-starter/  ← minimal config + profile for a TypeScript project
+│
 ├── commercial/          ← PROJECT-SPECIFIC BINDINGS (private — gitignored)
 │   └── config.json      ← model, validation commands, scoring weights, git targets,
 │                           API key env-var names, budget limits (RushPoint / your project)
@@ -119,13 +122,27 @@ to the legacy `autopilot/config.json`. This means:
 - **New deployments** drop their project config in `commercial/config.json`; the root file can be
   removed or kept as a template.
 
+`bundle-manifest.json` declares the two distributable variants (`core` / `commercial`) and the
+feature-flag registry. `lib/bundle-variants.mjs` detects the active variant at runtime; the active
+variant is re-exported from `config-loader.mjs` as `activeBundleVariant`. `build.mjs` assembles
+a distributable copy of either variant using the manifest's `include`/`exclude` patterns:
+
+```powershell
+node autopilot/build.mjs --variant core           # open-source bundle → dist/core/
+node autopilot/build.mjs --variant commercial     # full deployment bundle → dist/commercial/
+node autopilot/build.mjs --variant core --dry-run # preview without writing
+```
+
+See `docs/INTEGRATION.md` for the full plugin-authoring guide and feature-flag reference.
+
 ---
 
 ## 2b. Setting up for a new project (third-party quickstart)
 
 ```powershell
-# 1. Copy the example config into the commercial layer
-cp autopilot/config.json.example autopilot/commercial/config.json
+# 1. Copy the starter template into the commercial layer
+cp autopilot/templates/typescript-starter/config.json  autopilot/commercial/config.json
+cp autopilot/templates/typescript-starter/profile.json autopilot/profiles/my-project.json
 
 # 2. Edit the project-specific values
 #    - paths.appRoot / paths.appsDir … → your project layout

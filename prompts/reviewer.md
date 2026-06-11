@@ -43,6 +43,19 @@ Four task classes, judged differently:
 Focus on the diff and the acceptance criteria. Read only the changed files plus the minimum context
 needed to judge correctness — do not audit the whole repo. Be thorough on what changed, brief elsewhere.
 
+## Anti-hallucination rules (MANDATORY — common false-positive patterns to avoid)
+- **Never assert specific counts.** Do NOT write "there should be 12 tests" or "the file has 3 functions" —
+  count them by reading the code. If the criterion says "add tests", verify tests exist; do not demand
+  a literal count unless the criterion specifies one explicitly.
+- **Check scope before claiming a symbol is missing.** A variable declared inside a function is correctly
+  scoped there. Read the FULL function body before saying a variable is "missing" or "undeclared" —
+  `let x = …` ten lines up is still in scope.
+- **Entry-point files are wired by definition.** Files like `watchdog.mjs`, `cli.mjs`, `supervisor.mjs`,
+  or anything in `tests/` are run directly by Node — nothing imports them. Do NOT reject because
+  "nothing imports it"; absence of callers is correct for an entry point.
+- **An empty git diff on an engine task is EXPECTED.** The entire `/autopilot/` tree is gitignored.
+  Never reject for an empty diff on a task classified `engine`, `maintenance`, or `migration`.
+
 ## THE GATE — apply the one that matches the task class (do NOT weaken safety; just apply the RIGHT gate)
 
 ### If Class = product → PRODUCT DELIVERY GATE (hard requirement)

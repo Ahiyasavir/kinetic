@@ -27,6 +27,7 @@ import { pickImplementerModel } from './lib/route.mjs';
 import { rankBacklog, scoreTask, isCleanup, isProduct, productShare } from './lib/score.mjs';
 import * as git from './lib/git.mjs';
 import { runValidation, countLintErrors } from './lib/validate.mjs';
+import { runAutoFixes } from './lib/auto-fix.mjs';
 import { writeMirrors, appendDecision, ensureDecisionLogHeader } from './lib/files.mjs';
 import { ingestInbox, addInboxTask, ensureInbox } from './lib/inbox.mjs';
 import { snapshotProtected } from './lib/protect.mjs';
@@ -503,6 +504,21 @@ async function runCycle(state) {
     await git.checkoutIntegrationKeepingWork(REPO_ROOT, config.git.integrationBranch);
     const autoCommitted = await git.commitAllIfDirty(REPO_ROOT, `${config.git.commitPrefix}: ${task.id} ${task.title}`);
     if (autoCommitted) log('Captured implementer changes on integration branch.');
+
+    // AUTO-FIX PHASE (U-46) — eslint --fix + import-sort before AI validation
+    // Pre-flight auto-fixes eliminate trivial issues so the AI only tackles non-fixable errors.
+    let autoFixResult = null;
+    try {
+      autoFixResult = await runAutoFixes(config, REPO_ROOT, git, log);
+      if (autoFixResult && autoFixResult.fixed) {
+        log(`Auto-fix: ${autoFixResult.summary}`);
+        if (autoFixResult.errorsBefore != null && autoFixResult.errorsFixed != null) {
+          log(`  Lint errors: ${autoFixResult.errorsBefore} → ${autoFixResult.errorsAfter} (fixed ${autoFixResult.errorsFixed})`);
+        }
+      }
+    } catch (e) {
+      log(`⚠️  Auto-fix error (non-fatal): ${e.message}`);
+    }
 
     // VALIDATE (deterministic) — includes typecheck + admin build (required) + lint-regression guard
     log('Running validation…');

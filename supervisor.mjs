@@ -9,7 +9,7 @@
 //   node autopilot/supervisor.mjs status   # print a snapshot without touching the loop
 
 import { readFile, writeFile } from 'node:fs/promises';
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, rmSync } from 'node:fs';
 import {
   computeVelocityFactor, effectivePerDay, extractKeywords, bestLessonMatch, loadLessons, saveLessons
 } from './lib/learn.mjs';
@@ -23,15 +23,17 @@ import {
 } from './lib/state.mjs';
 import { runClaude, RateLimitError } from './lib/claude.mjs';
 import { pickImplementerModel } from './lib/route.mjs';
-import { rankBacklog, scoreTask, isCleanup, isProduct, productShare, effectiveTaskPriority } from './lib/score.mjs';
+import { rankBacklog, scoreTask, isCleanup, isProduct, productShare, effectiveTaskPriority, loadScoringPlugin } from './lib/score.mjs';
 import { selectablePool } from './lib/priority.mjs';
 import { isMacroVision, buildArchitectVars, normalizeArchitectPlan, applyArchitectPlanToState, ARCHITECT_MIN_TASKS, ARCHITECT_MAX_TASKS } from './lib/architect.mjs';
 import * as git from './lib/git.mjs';
 import { runValidation, countLintErrors } from './lib/validate.mjs';
+import { runAutoFixes } from './lib/auto-fix.mjs';
 import { writeMirrors, appendDecision, ensureDecisionLogHeader } from './lib/files.mjs';
 import { ingestInbox, addInboxTask, ensureInbox } from './lib/inbox.mjs';
 import { snapshotProtected, frozenProtectedFiles } from './lib/protect.mjs';
 import { createCore } from './core/index.mjs';
+import { runPostMortem } from './core/post-mortem.mjs';
 import { queuePathsResolvedLine, budgetsResolvedLine, telemetry as telemetryConfig, telemetryResolvedLine, apiPools, keyRotation, keyRotationActive, apiPoolsResolvedLine } from './config-loader.mjs';
 import { createKeyManager, makeRotatingRun } from './lib/key-manager.mjs';
 import { initTelemetry, recordEvent, flushTelemetry, getTelemetryState } from './lib/telemetry.mjs';
@@ -41,7 +43,7 @@ import { contextualName, contextId, handoffResolvedLine } from './lib/handoff-pa
 import { validateHandoffSchema, handoffSchemaResolvedLine } from './lib/handoff-schema.mjs';
 import { countTokens } from './lib/token-counter.mjs';
 import { isWithinBudget, budgetTokenCap, projectBudget } from './lib/token-pacer.mjs';
-import { EngineError, requireLocalPath, asEngineError } from './lib/engine-error.mjs';
+import { EngineError, LockError, OperationalError, requireLocalPath, asEngineError, formatEngineError } from './lib/engine-error.mjs';
 import { ensureBreaker, isTripped, recordCycleOutcome, checkCostCeiling, tripBreaker, resetBreaker } from './lib/circuit-breaker.mjs';
 import { classifyTask, reviewPolicy } from './lib/task-class.mjs';
 import { checkEvidence } from './lib/evidence.mjs';
@@ -52,6 +54,7 @@ import { resolveModelForRole } from './core/providers.mjs';
 import { nonLlmAudit } from './lib/verify.mjs';
 // Intelligence Efficiency Layer (P1–P3) — deterministic helpers layered on top of the existing systems.
 import { compileContext, contextHintBlock } from './lib/context-compiler.mjs';
+import { buildDependencyGraph } from './core/dependencies.mjs';
 import { selectorFingerprint, getCachedDecision, putCachedDecision, cacheHitRate } from './lib/fingerprint-cache.mjs';
 import { recordCycleCost, improvedEstimate, costKey } from './lib/cost-learning.mjs';
 // Multi-workspace foundation: the active workspace bundles root + state/queue/lock/budget/validation
@@ -62,6 +65,23 @@ import { compileFilters } from './lib/workspace-profile.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
+const supervisorStartedAt = Date.now();
+
+// Process-level safety net: catch any unhandled rejections or exceptions that escape from the main loop.
+// This ensures even catastrophic errors are logged with full context instead of crashing silently.
+const globalErrorHandler = (err) => {
+  const elapsedMs = Date.now() - supervisorStartedAt;
+  const errorOutput = (err && err.code) ? formatEngineError(err, { elapsedMs, activeStep: 'process-error' }) : '';
+  log(errorOutput || `FATAL UNHANDLED ERROR: ${err.stack || err.message}`);
+  process.exit(1);
+};
+process.on('unhandledRejection', (reason) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  globalErrorHandler(err);
+});
+process.on('uncaughtException', (err) => {
+  globalErrorHandler(err);
+});
 
 // AIMD adaptive interval constants (TCP-style self-tuning rate control).
 // On success: shrink the gap by 10% (additive increase toward minimum).
@@ -119,6 +139,10 @@ const PROJECT_ID = WORKSPACE.budgetScope;
 // engine's configured validation — identical to config.validation. Engine guardrails (syntax /
 // protected-core in validate.mjs) run regardless of this set.
 const wsConfig = { ...config, validation: WORKSPACE.validation };
+
+// Plugin scoring (U-44): load the optional scoring plugin declared in config.scoring.plugin.
+// No-op when the key is absent; non-fatal on missing file so the engine doesn't stall on startup.
+await loadScoringPlugin(config, __dirname).catch(() => {});
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const localTs = () => new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem', hour12: false,
@@ -242,6 +266,40 @@ function syncTelemetry(state) {
   state.telemetry = getTelemetryState();
 }
 
+// ---------- local dep-graph context maps (activates the U-45 dep-graph filter in runSelector) ----------
+// Scans the kinetic's own source tree (autopilot/lib, autopilot/core) for .mjs files, builds a
+// dependency graph, and wraps it in a ContextMaps envelope so runSelector's dep-graph filter can
+// prune the engine-file context to only what's relevant to the current candidate tasks. No-op cost
+// when zero files are found (early-return). Cached process-lifetime (the kinetic's own source is
+// stable within a run).
+let _localContextMaps = null;
+function buildLocalContextMaps() {
+  if (_localContextMaps) return _localContextMaps;
+  const scanDirs = [path.join(__dirname, 'lib'), path.join(__dirname, 'core')];
+  const fileMap = {};
+  const walk = (dir) => {
+    let entries; try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory() && !['node_modules', '.git', 'state'].includes(e.name)) { walk(full); continue; }
+      if (e.isFile() && /\.(mjs|js|cjs)$/.test(e.name)) {
+        const rel = path.relative(__dirname, full).replaceAll('\\', '/');
+        try { fileMap[rel] = readFileSync(full, 'utf8'); } catch { fileMap[rel] = null; }
+      }
+    }
+  };
+  for (const d of scanDirs) walk(d);
+  if (!Object.keys(fileMap).length) return null;
+  const depGraph = buildDependencyGraph(fileMap);
+  const fileIndex = {};
+  for (const rel of Object.keys(fileMap)) {
+    try { fileIndex[rel] = { size: statSync(path.join(__dirname, rel)).size, lang: 'js' }; } catch { fileIndex[rel] = {}; }
+  }
+  _localContextMaps = { fileIndex, symbolIndex: {}, dependencyGraph: depGraph, generatedAt: Date.now(), source: 'kinetic-local' };
+  log(`Local context maps: ${Object.keys(fileIndex).length} engine files indexed for dep-graph filter.`);
+  return _localContextMaps;
+}
+
 // ---------- core engine wiring ----------
 // The generic agent workflows (selector/implementer/reviewer/auditor) + role-invocation runtime live
 // in autopilot/core/ and know nothing about RushPoint. We inject the project-specific glue here: the
@@ -300,31 +358,11 @@ function validateOnLoad(file, data) {
 function taskKeywords(task) {
   return extractKeywords(`${task.title || ''} ${(task.acceptanceCriteria || []).join(' ')} ${task.notes || ''}`);
 }
-// Persist a lesson from a failed/struggling cycle so a future similar task is flagged + de-risked.
+// Persist a lesson from a failed/struggling cycle via the post-mortem agent (core/post-mortem.mjs).
+// The agent extracts explicit actionable rules and de-duplicates by rule similarity before persisting.
 // failureType ∈ 'blocked' | 'rollback' | 'high-revision' | 'crash'. Idempotent per (taskId, failureType).
 function recordLesson(task, { failureType, revisionCount = 0, impl, validation, review }) {
-  try {
-    const lessons = loadLessons(LESSONS_PATH, log);
-    if (lessons.some((l) => l.taskId === task.id && l.failureType === failureType)) return;
-    const entry = {
-      id: `L-${String(lessons.length + 1).padStart(4, '0')}`,
-      timestamp: nowIso(),
-      taskId: task.id,
-      title: task.title || '',
-      keywords: taskKeywords(task),
-      failureType,
-      revisionCount,
-      filesInvolved: (impl?.filesChanged || []).slice(0, 20),
-      errorSummary: ((review?.reasons || []).join('; ') || validation?.summary || '').slice(0, 500),
-      avoidHints: [...(review?.requiredFixes || []), ...(task.lastFailure?.requiredFixes || [])]
-        .filter(Boolean).slice(0, 8)
-    };
-    lessons.push(entry);
-    saveLessons(LESSONS_PATH, lessons);
-    log(`🧠 Recorded lesson ${entry.id} (${failureType}) for ${task.id} — keywords: ${entry.keywords.slice(0, 6).join(', ')}`);
-  } catch (e) {
-    log('lesson write error:', e.message);
-  }
+  runPostMortem(LESSONS_PATH, task, { failureType, revisionCount, impl, validation, review }, log);
 }
 
 // ---------- Architect Mode (Stage 2) ----------
@@ -377,7 +415,10 @@ async function runCycle(state) {
 
   // INBOX: pull in any tasks the user dropped since last cycle. They go to the FRONT of the backlog
   // and (via score.mjs userBoost) outrank everything, so a user request is always picked next.
-  const userTasks = await ingestInbox(INBOX_DIR, state, state.cycle).catch((e) => { log('inbox read error:', e.message); return []; });
+  const userTasks = await ingestInbox(INBOX_DIR, state, state.cycle).catch((e) => {
+    log(`⚠️  inbox read failed (non-fatal, continuing without new user tasks): ${e.message}`);
+    return [];
+  });
   if (userTasks.length) {
     for (const ut of userTasks) {
       const dup = [...state.queues.backlog, ...state.queues.done, ...state.queues.blocked].some((t) => t.id === ut.id);
@@ -394,7 +435,10 @@ async function runCycle(state) {
   // which then flow through normal priority/dep-gated selection. Trigger on the earliest pending
   // macro-vision task that hasn't been decomposed yet. Best-effort: any failure falls through to
   // normal selection rather than crashing the cycle.
-  const architected = await maybeRunArchitect(state).catch((e) => { log('architect error:', e.message); return false; });
+  const architected = await maybeRunArchitect(state).catch((e) => {
+    log(`⚠️  architect decomposition failed (non-fatal, falling back to normal selection): ${e.message}`);
+    return false;
+  });
   if (architected) return { outcome: 'architected' };
 
   // Anti-churn: tasks that just failed are on a short cooldown — don't offer them as candidates this
@@ -448,6 +492,10 @@ async function runCycle(state) {
   if (selection) {
     log(`Selector decision served from fingerprint cache (hit-rate ${(cacheHitRate(state) * 100).toFixed(0)}%, ~${SELECTOR_EST_TOKENS} tok saved this hit).`);
   } else {
+    // Build (or reuse) the local engine dep-graph and pass it as contextMaps — this activates the
+    // U-45 dep-graph filter in runSelector so it prunes context to only engine-relevant files.
+    // Falls back gracefully when the scan returns nothing (first call on a fresh install).
+    const localMaps = config.disableDependencyOptimization === true ? null : buildLocalContextMaps();
     selection = await core.runSelector(
       {
         CANDIDATES: fmtRanked(ranked) || '(backlog empty)',
@@ -460,11 +508,11 @@ async function runCycle(state) {
         HANDOFF_PATH: handoffRel('selection.json')
       },
       undefined,
-      // U-45: thread dep-opt config flags so the selector can filter context maps if a
-      // contextProvider is enabled.
       {
         disableDependencyOptimization: config.disableDependencyOptimization === true,
         profileSelectorTokens: config.profileSelectorTokens === true,
+        // Inject local engine dep-graph so the dep-graph filter runs even without an external contextProvider.
+        contextMaps: localMaps || undefined,
       }
     );
     // Cache only a usable, task-selecting decision. A null/no-pick result is left uncached so the next
@@ -673,6 +721,7 @@ async function runCycle(state) {
   let impl = null;
   let attempt = 0;
   let validation = { ok: false, summary: 'not run' };
+  let autoFixResult = { fixed: false, summary: 'not run' };
   // CROSS-CYCLE MEMORY: if this task already failed review/validation in an EARLIER cycle, seed the
   // implementer's first attempt with WHY it failed last time — so it fixes the known issue up front
   // instead of re-deriving (and likely repeating) the same mistake. (Within-cycle revises are handled
@@ -707,10 +756,29 @@ async function runCycle(state) {
     const autoCommitted = await git.commitAllIfDirty(GIT_ROOT, `${config.git.commitPrefix}: ${task.id} ${task.title}`);
     if (autoCommitted) log('Captured implementer changes on integration branch.');
 
+    // AUTO-FIX (U-46) — run eslint --fix + import-sort before validation to eliminate trivial issues
+    autoFixResult = await runAutoFixes(wsConfig, GIT_ROOT, git, log);
+    if (autoFixResult.fixed) {
+      log(`Auto-fixes applied: ${autoFixResult.summary}${autoFixResult.committed ? ' (committed)' : ''}`);
+    } else if (autoFixResult.summary !== 'auto-fix disabled') {
+      // Log even when no fixes committed, if auto-fix ran (files may be unchanged or errors remain)
+      const errorDelta = autoFixResult.errorsFixed !== null && autoFixResult.errorsFixed >= 0
+        ? ` [auto-fixed: ${autoFixResult.errorsFixed} error(s)]`
+        : autoFixResult.errorsBefore !== null && autoFixResult.errorsAfter !== null
+        ? ` [errors unchanged: ${autoFixResult.errorsBefore}]`
+        : '';
+      log(`Auto-fix attempted: ${autoFixResult.summary}${errorDelta}`);
+    }
+
     // VALIDATE (deterministic) — includes typecheck + admin build (required) + lint-regression guard
     log('Running validation…');
     validation = await runValidation(wsConfig, GIT_ROOT, lintBaseline, { cacheFile: VALIDATION_CACHE_PATH });
     log(`Validation: ${validation.summary}`);
+    // U-46: Explicit reporting of auto-fixed vs AI-resolved errors
+    if (autoFixResult && autoFixResult.errorsFixed !== null) {
+      const aiRequired = autoFixResult.errorsAfter || 0;
+      log(`  Auto-fixed: ${autoFixResult.errorsFixed} error(s) | Remaining for AI: ${aiRequired}`);
+    }
 
     // On-disk EVIDENCE for the reviewer's gate: prefer the implementer's declared verifyArtifacts,
     // else fall back to whatever the task itself declares. Catches "dead file nobody imports" + "named
@@ -765,7 +833,9 @@ async function runCycle(state) {
     state.stats.revisions += 1;
     if (attempt > config.cycle.maxReviseAttempts) break;
     const fixes = (review?.requiredFixes || []).join('\n - ') || 'Address the reviewer reasons and fix failing validation.';
+    const autoFixNote = autoFixResult.fixed ? `\n(NOTE: Auto-fixes already tried: ${autoFixResult.summary}. The remaining issues require manual code changes.)\n` : '';
     revisionBlock = `## Reviewer requested changes (revision ${attempt})\nFix these precisely, then re-commit:\n - ${fixes}\n` +
+      autoFixNote +
       (validation.ok ? '' : `\nValidation is currently FAILING: ${validation.summary}. Make it pass.\n`);
     log(`Revision ${attempt} requested.`);
   }
@@ -1209,20 +1279,30 @@ async function acquireLock() {
       await writeFile(LOCK_PATH, JSON.stringify({ pid: process.pid, started: nowIso() }), { flag: 'wx' });
       break; // acquired
     } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
+      if (e.code !== 'EEXIST') {
+        // Filesystem error (permissions, etc.) is a fatal engine fault.
+        throw new LockError(
+          `Supervisor failed to acquire its lock at "${LOCK_PATH}": ${e.message}. ` +
+          `This is likely a permissions issue or the lock file is on a read-only filesystem.`,
+          { cause: e }
+        );
+      }
       let prev = {};
       try { prev = JSON.parse(await readFile(LOCK_PATH, 'utf8')); } catch { /* unreadable */ }
       if (prev.pid && prev.pid !== process.pid && pidAlive(prev.pid)) {
-        log(`REFUSING TO START: another supervisor is already running (pid ${prev.pid}, since ${prev.started}).`);
-        log('Only ONE supervisor may run per repo. Stop it first, or delete autopilot/state/supervisor.lock if you are certain it is dead.');
+        // Another supervisor is running — this is not a fatal error, just return false to exit gracefully.
+        log(`Another supervisor is already running (pid ${prev.pid}, since ${prev.started}) — refusing to start (return).`);
         return false;
       }
       // Lock exists but its owner is gone (or it is ours) → reclaim it and retry the atomic create.
       log(`Found a stale lock (pid ${prev.pid ?? '?'} not running) — reclaiming.`);
       try { rmSync(LOCK_PATH); } catch { /* ignore */ }
       if (attempt === 1) { // couldn't reclaim after one retry — refuse rather than risk a double-run
-        log('Could not acquire the lock safely — refusing to start.');
-        return false;
+        throw new LockError(
+          `Supervisor could not acquire the lock safely after reclaim attempt. ` +
+          `This suggests a race condition or a stale lock file that cannot be safely removed.`,
+          { remediation: 'Verify no other supervisor process is running, then manually delete the lock file and retry.' }
+        );
       }
     }
   }
@@ -1333,7 +1413,7 @@ async function cmdRun() {
       recordEvent('error', { kind: 'cycle-crash', cycle: state.cycle, message: err.message });
       recordEvent('cycle-end', { cycle: state.cycle, outcome: 'error',
         durationMs: Date.now() - cycleStartedAt, tokens: currentCycleTokens() });
-      log('Cycle error:', err.message);
+      log(`⚠️  Cycle ${state.cycle} crashed (non-fatal, reverting to backlog): ${err.message}`);
       if (state.current) recordLesson(state.current, { failureType: 'crash', revisionCount: 0, validation: { summary: err.message }, review: { reasons: [err.message] } });
       if (state.current?.baseSha) await git.resetHard(GIT_ROOT, state.current.baseSha).catch(() => {});
       await git.ensureOnIntegration(GIT_ROOT, config.git.integrationBranch).catch(() => {});
@@ -1495,6 +1575,9 @@ try {
   else if (cmd === 'run' || cmd === 'resume') await cmdRun();
   else { log(`Unknown command "${cmd}". Use: start | stop | status | reset-breaker | reconcile [--apply] [--dedupe] | verify | add "task" | run | init | route | reprioritize`); process.exit(1); }
 } catch (err) {
-  log('Fatal:', err.stack || err.message);
+  const elapsedMs = Date.now() - supervisorStartedAt;
+  const activeStep = cmd === 'run' ? 'main-loop' : `cmd-${cmd}`;
+  const errorOutput = (err && err.code) ? formatEngineError(err, { elapsedMs, activeStep }) : '';
+  log(errorOutput || `Fatal: ${err.stack || err.message}`);
   process.exit(1);
 }

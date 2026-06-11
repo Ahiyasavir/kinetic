@@ -20,6 +20,9 @@ import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertValidConfig } from './lib/config-validator.mjs';
+import { activeBundleVariant, bundleManifest, isFeatureAvailable, bundleVariantResolvedLine } from './lib/bundle-variants.mjs';
+// Re-export bundle-variant API so all consumers get it through the canonical config-loader entry-point.
+export { activeBundleVariant, bundleManifest, isFeatureAvailable, bundleVariantResolvedLine };
 
 const KINETIC_DIR = path.dirname(fileURLToPath(import.meta.url));
 // Pluggable config loader (U-44): prefer commercial/config.json (the project-specific bundle layer)
@@ -131,6 +134,32 @@ export const validation = {
  *  module hardcodes 'npm run lint' — the project's lint command lives in config.json. */
 export function lintCommand() {
   return (validation.commands.find((c) => c.name === 'lint') || {}).cmd || '';
+}
+
+// Auto-fix configuration (U-46). Pre-flight linting and import-sorting before AI invocation to
+// eliminate trivial fixable issues. Omitting the `autoFix` block disables auto-fixing (fully backward
+// compatible). Consumed via this loader → { autoFix } and autopilot/lib/auto-fix.mjs.
+const DEFAULT_AUTOFIX = {
+  enabled: false,
+  lintFixCommand: '',
+  importSortCommand: '',
+  timeoutMs: 600000
+};
+
+const rawAutoFix = { ...(config.autoFix || {}) };
+delete rawAutoFix._comment; // documentation only — never treat as a config value
+export const autoFix = {
+  enabled: rawAutoFix.enabled ?? DEFAULT_AUTOFIX.enabled,
+  lintFixCommand: rawAutoFix.lintFixCommand || DEFAULT_AUTOFIX.lintFixCommand,
+  importSortCommand: rawAutoFix.importSortCommand || DEFAULT_AUTOFIX.importSortCommand,
+  timeoutMs: rawAutoFix.timeoutMs ?? DEFAULT_AUTOFIX.timeoutMs
+};
+
+/** Startup confirmation that autoFix config was loaded. */
+export function autoFixResolvedLine() {
+  return autoFix.enabled
+    ? `config-loaded autoFix from config.json → enabled (lint: ${!!autoFix.lintFixCommand}, imports: ${!!autoFix.importSortCommand})`
+    : 'config-loaded autoFix from config.json → disabled';
 }
 
 // Per-project token budgets (U-33). Maps a projectId (repo+goal slug) to its independent limits so the
@@ -329,6 +358,7 @@ export function providersResolvedLine() {
 
 // CLI: print the confirmation + the absolute resolution so the wiring is verifiable today.
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  console.log(bundleVariantResolvedLine());
   console.log(pathsResolvedLine());
   console.log(queuePathsResolvedLine());
   console.log(budgetsResolvedLine());
@@ -337,6 +367,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   console.log(apiPoolsResolvedLine());
   console.log(providersResolvedLine());
   console.log(validationResolvedLine());
+  console.log(autoFixResolvedLine());
   console.log(JSON.stringify({
     repoRoot: paths.repoRoot,
     appRoot: paths.appRoot,

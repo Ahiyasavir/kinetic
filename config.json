@@ -172,6 +172,13 @@
     "lintRegressionGuard": true,
     "e2e": { "enabled": false, "cmd": "node scripts/e2e-verify.mjs", "timeoutMs": 600000 }
   },
+  "autoFix": {
+    "_comment": "Auto-fix configuration (U-46). Pre-flight linting and import-sorting before AI invocation to eliminate trivial fixable issues. Runs BEFORE validation; if auto-fixes resolve all issues, AI revision is skipped entirely. `enabled:true` activates; `lintFixCommand` and `importSortCommand` define the commands (empty string disables). Execution order: eslint --fix FIRST (via `lintFixCommand`), then prettier for import/format ordering SECOND (via `importSortCommand`). Omit this block or set `enabled:false` to disable (fully backward compatible). Consumed via autopilot/config-loader.mjs → { autoFix } and autopilot/lib/auto-fix.mjs.",
+    "enabled": true,
+    "lintFixCommand": "npm run lint:fix",
+    "importSortCommand": "npm run format",
+    "timeoutMs": 600000
+  },
   "telemetry": {
     "enabled": true,
     "endpoint": null,

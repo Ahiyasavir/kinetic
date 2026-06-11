@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { config, queuePaths } from './config-loader.mjs';
 import { createCore } from './core/index.mjs';
 import { getAdapter } from './lib/providers/index.mjs';
+import { resolveModelForRole } from './core/providers.mjs';
 import { contextualName } from './lib/handoff-paths.mjs';
 import { buildArchitectVars, normalizeArchitectPlan } from './lib/architect.mjs';
 
@@ -85,7 +86,7 @@ autopilot/lib/control-api.mjs (response shapes), autopilot/lib/key-manager.mjs (
 async function main() {
   const min = config.architect?.minTasks ?? 20;
   const max = config.architect?.maxTasks ?? 40;
-  const model = config.models?.architect || config.architectModel || 'claude-fable-5';
+  const model = resolveModelForRole('architect', 'premium', config);
   const adapter = getAdapter(config);
 
   await mkdir(HANDOFF_DIR, { recursive: true });

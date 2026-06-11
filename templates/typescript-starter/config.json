@@ -1,0 +1,74 @@
+{
+  "_comment": "Template: typescript-starter (U-44). Minimal autopilot config for a TypeScript project. Copy to autopilot/commercial/config.json and fill in your project-specific values. See autopilot/docs/INTEGRATION.md for the full onboarding guide.",
+  "provider": "claude",
+  "profile": "typescript-starter",
+  "_profile_comment": "Set to a profile name in autopilot/profiles/. Use 'generic' for a blank profile, or copy templates/typescript-starter/profile.json to profiles/typescript-starter.json and keep this value.",
+  "model": "claude-sonnet-4-6",
+  "models": {
+    "selector":          "claude-haiku-4-5",
+    "reviewer":          "claude-sonnet-4-6",
+    "auditor":           "claude-haiku-4-5",
+    "architect":         "claude-sonnet-4-6",
+    "implementerHigh":   "claude-sonnet-4-6",
+    "implementerLow":    "claude-haiku-4-5",
+    "implementerLowest": "claude-haiku-4-5"
+  },
+  "paths": {
+    "appRoot": ".",
+    "_comment": "Set appRoot to your project root relative to the autopilot/ parent directory. Leave '.' if the autopilot/ folder lives inside your repo root."
+  },
+  "validation": {
+    "_comment": "Replace these commands with whatever validates your project.",
+    "commands": [
+      { "name": "typecheck", "cmd": "npx tsc --noEmit", "required": true,  "timeoutMs": 120000 },
+      { "name": "build",     "cmd": "npx tsc",          "required": false, "timeoutMs": 120000 }
+    ],
+    "lintRegressionGuard": false,
+    "e2e": { "enabled": false }
+  },
+  "git": {
+    "integrationBranch": "main",
+    "baseBranch":        "main",
+    "commitPrefix":      "kinetic"
+  },
+  "cli": {
+    "bin":            "claude",
+    "outputFormat":   "json",
+    "permission":     "--dangerously-skip-permissions",
+    "timeoutMs":      1800000,
+    "maxTurnsPerCall": 60
+  },
+  "cycle": {
+    "maxReviseAttempts":        2,
+    "cooldownBetweenCyclesMs":  60000,
+    "backlogTopUpThreshold":    4
+  },
+  "rateLimit": {
+    "baseCooldownMs": 1200000,
+    "maxCooldownMs":  2700000
+  },
+  "durationDays": 7,
+  "phase": "features",
+  "scoring": {
+    "weights": { "userImpact": 5, "adminImpact": 3, "reliability": 3, "productRisk": 2, "cleanupValue": 1 },
+    "categoryBonus": {},
+    "minProductShare":        0.5,
+    "minProductTasks":        3,
+    "maxAttemptsBeforeBlock": 3,
+    "maxReviewFailAttempts":  2
+  },
+  "budgetGovernor": {
+    "enabled": false,
+    "_comment": "Set enabled:true and configure weeklyTokenQuota to gate the loop on token spend."
+  },
+  "circuitBreaker": {
+    "enabled": true,
+    "maxConsecutiveFailures":    5,
+    "maxConsecutiveRateLimits":  8,
+    "maxConsecutiveUnproductive": 12
+  },
+  "implementerRouting": {
+    "opusMinRisk": 4,
+    "opusKeywords": ["security", "data model", "schema", "migration", "atomic", "transaction"]
+  }
+}

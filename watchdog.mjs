@@ -19,7 +19,7 @@ import { initTelemetry, recordEvent, flushTelemetry } from './lib/telemetry.mjs'
 import { lockPaths, locksResolvedLine } from './lib/lock-manager.mjs';
 import { gitConfig, gitConfigResolvedLine } from './lib/git-config-loader.mjs';
 import * as git from './lib/git.mjs';
-import { requireLocalPath } from './lib/engine-error.mjs';
+import { requireLocalPath, formatEngineError, LockError } from './lib/engine-error.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // The supervisor's working directory is the config-driven git target (U-35): the configured external
@@ -44,6 +44,23 @@ const localTs = () => new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerus
 const log = (...a) => console.log(`[watchdog ${localTs()}]`, ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pidAlive = (pid) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+const watchdogStartedAt = Date.now();
+
+// Process-level safety net: catch any unhandled rejections or exceptions that escape from main().
+// This ensures even catastrophic errors are logged with full context instead of crashing silently.
+const globalErrorHandler = (err) => {
+  const elapsedMs = Date.now() - watchdogStartedAt;
+  const errorOutput = (err && err.code) ? formatEngineError(err, { elapsedMs, activeStep: 'process-error' }) : '';
+  log(errorOutput || `FATAL UNHANDLED ERROR: ${err.stack || err.message}`);
+  process.exit(1);
+};
+process.on('unhandledRejection', (reason) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  globalErrorHandler(err);
+});
+process.on('uncaughtException', (err) => {
+  globalErrorHandler(err);
+});
 
 mkdirSync(STATE_DIR, { recursive: true });
 
@@ -52,7 +69,13 @@ function acquireWatchdogLock() {
   for (let i = 0; i < 2; i++) {
     try { const fd = openSync(WD_LOCK, 'wx'); writeFileSync(fd, JSON.stringify({ pid: process.pid })); closeSync(fd); return true; }
     catch (e) {
-      if (e.code !== 'EEXIST') throw e;
+      if (e.code !== 'EEXIST') {
+        throw new LockError(
+          `Watchdog failed to acquire its lock at "${WD_LOCK}": ${e.message}. ` +
+          `This is likely a permissions issue or the lock file is on a read-only filesystem.`,
+          { cause: e }
+        );
+      }
       let prev = {}; try { prev = JSON.parse(readFileSync(WD_LOCK, 'utf8')); } catch {}
       if (prev.pid && prev.pid !== process.pid && pidAlive(prev.pid)) { log(`another watchdog is running (pid ${prev.pid}) — exiting.`); return false; }
       try { rmSync(WD_LOCK); } catch {}
@@ -163,4 +186,9 @@ async function main() {
   process.exit(0);
 }
 
-main().catch((e) => { log('fatal:', e.stack || e.message); process.exit(1); });
+main().catch((e) => {
+  const elapsedMs = Date.now() - watchdogStartedAt;
+  const errorOutput = (e && e.code) ? formatEngineError(e, { elapsedMs, activeStep: 'watchdog-startup' }) : '';
+  log(errorOutput || `fatal: ${e.stack || e.message}`);
+  process.exit(1);
+});

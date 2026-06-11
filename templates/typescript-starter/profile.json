@@ -1,0 +1,32 @@
+{
+  "_comment": "Template workspace profile for a TypeScript project (U-44). Copy to autopilot/profiles/typescript-starter.json (or any name that matches config.json → profile). Provides the goal phases, selection filters, implementer conventions, and a starter seed backlog. See autopilot/docs/INTEGRATION.md for the full profile-authoring guide.",
+  "id": "typescript-starter",
+  "label": "TypeScript Starter",
+  "goalPhases": ["structure", "features", "quality", "continuous"],
+  "metadata": {
+    "domain": "typescript",
+    "description": "Template profile for a TypeScript project. Replace the seed tasks with your own backlog."
+  },
+  "selectionFilters": {
+    "shippedFeature":      "",
+    "polishIntent":        "polish|improve|refine|harden|accessibility|a11y|error.?state|loading.?state",
+    "uiPolish":            "",
+    "hardeningKeep":       "harden|resilient|retry|backoff|error.?handling|crash|recover|test|coverage",
+    "applyHardeningFreeze": false
+  },
+  "promptProfile": "TypeScript project conventions:\n- Use strict TypeScript (no `any`, no `ts-ignore` without a comment explaining why).\n- Prefer `const` over `let`; avoid mutation where practical.\n- All new exports must be typed explicitly — no inferred `any` from external sources.\n- Run `npx tsc --noEmit` and verify it passes before committing.",
+  "seed": [
+    {
+      "id": "TS-1",
+      "goal": "structure",
+      "title": "scaffold: set up TypeScript project with tsconfig.json, src/ directory, and build/typecheck scripts in package.json",
+      "dims": { "userImpact": 3, "adminImpact": 2, "reliability": 4, "productRisk": 2, "cleanupValue": 1 },
+      "effort": 2,
+      "risk": 1,
+      "deps": [],
+      "source": "seed",
+      "status": "backlog",
+      "notes": "Starter scaffold task. Replace with your own initial tasks or clear seed[] entirely and add tasks via the inbox."
+    }
+  ]
+}
