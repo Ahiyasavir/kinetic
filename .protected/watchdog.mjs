@@ -14,6 +14,7 @@ import { spawn } from 'node:child_process';
 import { writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, openSync, closeSync, statSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { LockError, OperationalError, formatEngineError } from '../lib/engine-error.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');               // the worktree root (cwd for the supervisor)
@@ -37,7 +38,12 @@ function acquireWatchdogLock() {
   for (let i = 0; i < 2; i++) {
     try { const fd = openSync(WD_LOCK, 'wx'); writeFileSync(fd, JSON.stringify({ pid: process.pid })); closeSync(fd); return true; }
     catch (e) {
-      if (e.code !== 'EEXIST') throw e;
+      if (e.code !== 'EEXIST') {
+        throw new OperationalError(
+          `Watchdog failed to acquire lock at "${WD_LOCK}": ${e.message}. The lock file may be unwritable.`,
+          { cause: e, operation: 'lock-acquire', remediation: `Check that ${path.dirname(WD_LOCK)} exists and is writable. Ensure no other process holds the lock.` }
+        );
+      }
       let prev = {}; try { prev = JSON.parse(readFileSync(WD_LOCK, 'utf8')); } catch {}
       if (prev.pid && prev.pid !== process.pid && pidAlive(prev.pid)) { log(`another watchdog is running (pid ${prev.pid}) — exiting.`); return false; }
       try { rmSync(WD_LOCK); } catch {}
@@ -100,4 +106,12 @@ async function main() {
   process.exit(0);
 }
 
-main().catch((e) => { log('fatal:', e.stack || e.message); process.exit(1); });
+// Top-level error handler: format EngineErrors nicely, fall back to raw stack for unknown errors.
+main().catch((e) => {
+  if (e instanceof OperationalError || e instanceof LockError || e.code?.startsWith('ENGINE_')) {
+    console.error(formatEngineError(e, { activeStep: 'startup' }));
+  } else {
+    log('fatal (unknown error):', e.stack || e.message);
+  }
+  process.exit(1);
+});

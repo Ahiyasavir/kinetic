@@ -16,6 +16,7 @@ import {
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ConfigError, StateError, LockError, OperationalError, formatEngineError } from './lib/engine-error.mjs';
 
 import {
   GOAL_PHASES, emptyState, initState, loadState, saveState, ensureDirs,
@@ -41,8 +42,18 @@ const INBOX_DIR = path.join(__dirname, 'inbox');
 const LOCK_PATH = path.join(STATE_DIR, 'supervisor.lock');
 const WD_LOCK_PATH = path.join(STATE_DIR, 'watchdog.lock');
 const STOP_FLAG = path.join(STATE_DIR, 'STOP');
+const CONFIG_PATH = path.join(__dirname, 'config.json');
 
-const config = JSON.parse(await readFile(path.join(__dirname, 'config.json'), 'utf8'));
+let config;
+try {
+  const raw = await readFile(CONFIG_PATH, 'utf8');
+  config = JSON.parse(raw);
+} catch (err) {
+  const message = err.code === 'ENOENT'
+    ? `Config file not found at "${CONFIG_PATH}". This is required for the kinetic to run.`
+    : `Config file at "${CONFIG_PATH}" is not valid JSON: ${err.message}`;
+  throw new ConfigError(message, { cause: err, path: CONFIG_PATH });
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const localTs = () => new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem', hour12: false,
@@ -249,7 +260,12 @@ async function runCycle(state) {
 
   // INBOX: pull in any tasks the user dropped since last cycle. They go to the FRONT of the backlog
   // and (via score.mjs userBoost) outrank everything, so a user request is always picked next.
-  const userTasks = await ingestInbox(INBOX_DIR, state, state.cycle).catch((e) => { log('inbox read error:', e.message); return []; });
+  let userTasks = [];
+  try {
+    userTasks = await ingestInbox(INBOX_DIR, state, state.cycle);
+  } catch (e) {
+    log(`⚠️  Inbox read error: ${e.message} — user tasks will not be ingested this cycle. Check ${INBOX_DIR}.`);
+  }
   if (userTasks.length) {
     for (const ut of userTasks) {
       const dup = [...state.queues.backlog, ...state.queues.done, ...state.queues.blocked].some((t) => t.id === ut.id);
@@ -802,9 +818,17 @@ async function cmdInit() {
     log('state.json already exists — refusing to overwrite. Delete autopilot/state/ to re-init.');
     return;
   }
-  const state = await initState(STATE_PATH, config);
-  await ensureDecisionLogHeader(STATE_DIR, state);
-  await writeMirrors(STATE_DIR, state);
+  let state;
+  try {
+    state = await initState(STATE_PATH, config);
+    await ensureDecisionLogHeader(STATE_DIR, state);
+    await writeMirrors(STATE_DIR, state);
+  } catch (err) {
+    throw new StateError(
+      `Failed to initialize supervisor state: ${err.message}. Check that ${STATE_DIR} is writable.`,
+      { cause: err, path: STATE_PATH }
+    );
+  }
   log(`Initialized. Deadline: ${state.deadlineAt}. Backlog: ${state.queues.backlog.length} task(s).`);
   log('Start with: node autopilot/supervisor.mjs run');
 }
@@ -886,7 +910,12 @@ async function acquireLock() {
       await writeFile(LOCK_PATH, JSON.stringify({ pid: process.pid, started: nowIso() }), { flag: 'wx' });
       break; // acquired
     } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
+      if (e.code !== 'EEXIST') {
+        throw new OperationalError(
+          `Supervisor failed to acquire lock at "${LOCK_PATH}": ${e.message}. The lock file may be unwritable.`,
+          { cause: e, operation: 'lock-acquire', remediation: `Check that ${path.dirname(LOCK_PATH)} exists and is writable. Ensure no other supervisor process is running.` }
+        );
+      }
       let prev = {};
       try { prev = JSON.parse(await readFile(LOCK_PATH, 'utf8')); } catch { /* unreadable */ }
       if (prev.pid && prev.pid !== process.pid && pidAlive(prev.pid)) {
@@ -923,7 +952,15 @@ async function cmdRun() {
   await ensureInbox(INBOX_DIR);
   if (!(await acquireLock())) return;
   snapshotProtected(); // freeze a known-good copy of supervisor.mjs/watchdog.mjs (Strangler-Fig guard)
-  let state = await loadState(STATE_PATH);
+  let state;
+  try {
+    state = await loadState(STATE_PATH);
+  } catch (err) {
+    throw new StateError(
+      `Failed to load supervisor state from "${STATE_PATH}": ${err.message}. The state file may be corrupted.`,
+      { cause: err, path: STATE_PATH }
+    );
+  }
 
   // graceful shutdown — state is already flushed each step, this just records intent
   let stopping = false;
@@ -939,6 +976,7 @@ async function cmdRun() {
     if (existsSync(STOP_FLAG)) { log('STOP flag detected — exiting at cycle boundary.'); break; }
     await paceForWeeklyBudget(state); // spread consumption to the weekly reset (shared account)
     if (existsSync(STOP_FLAG)) { log('STOP flag detected — exiting at cycle boundary.'); break; }
+    const cycleStartMs = Date.now();
     try {
       await runCycle(state);
     } catch (err) {
@@ -947,7 +985,18 @@ async function cmdRun() {
         continue;
       }
       // Non-fatal cycle error: roll back to snapshot, re-queue, keep the run alive.
-      log('Cycle error:', err.message);
+      const elapsedMs = Date.now() - cycleStartMs;
+      const errContext = {
+        elapsedMs,
+        activeStep: `cycle ${state.cycle}`,
+        lastState: state.current ? `working on ${state.current.id}` : 'between cycles'
+      };
+      if (err instanceof OperationalError || err instanceof StateError || err.code?.startsWith('ENGINE_')) {
+        log(formatEngineError(err, errContext));
+      } else {
+        log(`⚠️  Cycle ${state.cycle} error (${Math.round(elapsedMs / 1000)}s): ${err.message}`);
+        if (err.stack) log(err.stack);
+      }
       if (state.current) recordLesson(state.current, { failureType: 'crash', revisionCount: 0, validation: { summary: err.message }, review: { reasons: [err.message] } });
       if (state.current?.baseSha) await git.resetHard(REPO_ROOT, state.current.baseSha).catch(() => {});
       await git.ensureOnIntegration(REPO_ROOT, config.git.integrationBranch).catch(() => {});
@@ -1040,6 +1089,12 @@ try {
   else if (cmd === 'run' || cmd === 'resume') await cmdRun();
   else { log(`Unknown command "${cmd}". Use: start | stop | status | add "task" | run | init | route | reprioritize`); process.exit(1); }
 } catch (err) {
-  log('Fatal:', err.stack || err.message);
+  // Format engine-level errors nicely; fall back to raw stack for unknown errors.
+  if (err instanceof ConfigError || err instanceof StateError || err instanceof OperationalError ||
+      err instanceof LockError || err.code?.startsWith('ENGINE_')) {
+    console.error(formatEngineError(err, { activeStep: `${cmd} command` }));
+  } else {
+    log('Fatal (unknown error):', err.stack || err.message);
+  }
   process.exit(1);
 }
