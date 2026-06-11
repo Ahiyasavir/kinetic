@@ -35,10 +35,52 @@ export function rulesNearDuplicate(ruleA, ruleB) {
   return inter / Math.min(A.size, B.size) >= 0.6;
 }
 
+// Return a file-type / command pattern string describing what triggered the failure category.
+// Used as the queryable `pattern` field in lessons.json entries.
+function buildPattern(category, filesInvolved) {
+  switch (category) {
+    case 'product-gate':     return 'class=product; gitignored=true; allowGitignored=false';
+    case 'marker-absent':    return 'console.log(`...${var}...`); template-literal in static verifyArtifacts check';
+    case 'frozen-file':      return 'structural/frozen file referenced in acceptance criteria';
+    case 'timeout':          return 'tsc compilation; large file I/O; execution >30s';
+    case 'validation':       return '*.ts; npm run typecheck; npm run build';
+    case 'rollback-typecheck': return '*.ts; npm run typecheck; TypeScript type-error';
+    case 'rollback-lint':    return '*.ts; eslint; lint-regression guard';
+    case 'rollback-evidence': return 'verifyArtifacts[].wired=false; dead-file (no import)';
+    case 'rollback-review':  return 'review.approved=false; missing verifyArtifacts evidence';
+    case 'high-revision': {
+      const exts = [...new Set((filesInvolved || []).map(f => (f.split('.').pop() || '')).filter(Boolean))];
+      return exts.length ? `high-revision; files: *.${exts.join(', *.')}` : 'high-revision; multiple files';
+    }
+    case 'blocked-generic':  return 'blocked-cycle; unknown failure pattern';
+    default:                 return `${category}; generic failure pattern`;
+  }
+}
+
+// Base confidence (0–1) for a rule derived from the given failure category.
+// Higher for precise, actionable categories; lower for generic/ambiguous ones.
+function baseConfidence(category) {
+  const CONF = {
+    'product-gate':       0.95,
+    'marker-absent':      0.92,
+    'rollback-evidence':  0.90,
+    'rollback-typecheck': 0.85,
+    'rollback-lint':      0.85,
+    'validation':         0.80,
+    'frozen-file':        0.75,
+    'high-revision':      0.55,
+    'timeout':            0.60,
+    'rollback-review':    0.55,
+    'blocked-generic':    0.45,
+    'generic':            0.40,
+  };
+  return CONF[category] ?? 0.45;
+}
+
 // Classify into a specific sub-category for targeted rule generation.
 // Returns one of: 'product-gate' | 'marker-absent' | 'frozen-file' | 'timeout' | 'validation' |
 //                 'rollback-typecheck' | 'rollback-lint' | 'rollback-evidence' | 'rollback-review' |
-//                 'high-revision' | 'generic'
+//                 'high-revision' | 'blocked-generic' | 'generic'
 function categorizeFailure(failureType, errorText) {
   const e = String(errorText || '').toLowerCase();
   if (failureType === 'blocked') {
@@ -152,14 +194,26 @@ export function runPostMortem(lessonsPath, task, ctx, logger = () => {}) {
     );
     const errorSummary = ((review?.reasons || []).join('; ') || validation?.summary || '').slice(0, 500);
     const now = new Date().toISOString();
+    const filesInvolved = (impl?.filesChanged || []).slice(0, 20);
+
+    // Pre-compute structured fields shared by new-entry and de-dup update paths.
+    const errorText = [
+      ...(review?.reasons || []),
+      validation?.summary || '',
+      ...(review?.requiredFixes || []),
+    ].join(' ');
+    const category = categorizeFailure(failureType, errorText);
+    const pattern = buildPattern(category, filesInvolved);
 
     // Primary de-dup: near-duplicate rule text for the same failureType → increment occurrenceCount.
     const existing = lessons.find(
-      (l) => l.failureType === failureType && rulesNearDuplicate(l.rule || '', rule)
+      (l) => l.failureType === failureType && rulesNearDuplicate(l.rule || l.fix || '', rule)
     );
     if (existing) {
       existing.occurrenceCount = (existing.occurrenceCount || 1) + 1;
       existing.context = context; // update to latest occurrence
+      // Boost confidence on repeated occurrence (capped at 0.98).
+      existing.confidence = Math.min(0.98, (existing.confidence ?? baseConfidence(category)) + 0.05);
       saveLessons(lessonsPath, lessons);
       logger(`🧠 Post-mortem: updated lesson ${existing.id} (${failureType}, ×${existing.occurrenceCount}) — ${rule.slice(0, 60)}…`);
       return existing;
@@ -173,19 +227,26 @@ export function runPostMortem(lessonsPath, task, ctx, logger = () => {}) {
 
     const entry = {
       id: `L-${String(lessons.length + 1).padStart(4, '0')}`,
-      // New structured fields (the key additions from this task)
+      // Structured fields required by the U-47 spec schema
+      // (queryable by U-48 Implementer/Reviewer injection and U-57 Proactive Scanner)
+      category,       // sub-category: 'product-gate' | 'rollback-typecheck' | etc.
+      pattern,        // file-type / command pattern that triggered the failure
+      fix: rule,      // human-readable actionable rule ("Never X" / "If X, then Y")
+      confidence: baseConfidence(category), // 0–1 certainty of the rule's applicability
+      learnedAt: now, // ISO timestamp (canonical alias for firstSeen)
+      // Extended fields for rich context and de-duplication
       failureType,
-      rule,
+      rule,           // kept alongside `fix` for backward compat with bestLessonMatch() consumers
       context,
       firstSeen: now,
       occurrenceCount: 1,
-      // Legacy fields preserved for backward compatibility with bestLessonMatch() and other consumers
+      // Legacy fields preserved for backward compatibility
       timestamp: now,
       taskId: task.id,
       title: task.title || '',
       keywords,
       revisionCount,
-      filesInvolved: (impl?.filesChanged || []).slice(0, 20),
+      filesInvolved,
       errorSummary,
       avoidHints: [...(review?.requiredFixes || []), ...(task.lastFailure?.requiredFixes || [])]
         .filter(Boolean).slice(0, 8),
