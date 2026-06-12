@@ -1,0 +1,25 @@
+{
+  "id": "U-npx",
+  "title": "package: publish kinetic-agent as an npx-installable CLI package",
+  "goal": "packaging",
+  "risk": 2,
+  "class": "engine",
+  "rationale": "cli.mjs and core/init.mjs are already built (U-38, U-40). The only missing piece is a package.json with a bin entry and an .npmignore, so any developer can run `npx kinetic-agent init` to scaffold a new project — enabling external adoption without a global install.",
+  "implementationHints": [
+    "Create autopilot/package.json with: name='kinetic-agent', version='0.1.0', type='module', bin={'kinetic-agent':'./cli.mjs'}, files=['cli.mjs','core/init.mjs','core/templates']. Do NOT include state/, run.log, devlog.log, .account/, or node_modules.",
+    "Create autopilot/.npmignore listing: state/, *.lock, run.log, devlog.log, install.log, .account/, node_modules/, tests/",
+    "Verify cli.mjs has '#!/usr/bin/env node' as first line (it already does — U-38).",
+    "Add a 'postinstall' or 'prepare' note in package.json pointing to the README for the manual npm publish step — do NOT auto-publish from the engine.",
+    "Do NOT modify cli.mjs, init.mjs, or any existing engine file. This is packaging only."
+  ],
+  "acceptanceCriteria": [
+    "autopilot/package.json exists with correct bin entry pointing to cli.mjs",
+    "autopilot/.npmignore exists and excludes state/, *.lock, run.log, devlog.log, .account/",
+    "Running `node autopilot/cli.mjs --help` still works (no regression)",
+    "package.json is valid JSON and passes `node -e \"require('./autopilot/package.json')\"` "
+  ],
+  "verifyArtifacts": [
+    { "path": "autopilot/package.json", "wired": false },
+    { "path": "autopilot/.npmignore", "wired": false }
+  ]
+}

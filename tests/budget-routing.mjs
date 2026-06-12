@@ -107,6 +107,34 @@ check('engine task with empty diff is NOT penalized for the diff', () => {
   assert.equal(v.ok, true);
 });
 
+// ── riskToModel routing (U-56) ───────────────────────────────────────────────
+const CFG_RTM = { ...CFG, implementerRouting: { ...CFG.implementerRouting, opusMinRisk: 4,
+  riskToModel: { '1': 'claude-haiku-4-5', '2': 'claude-haiku-4-5', '3': 'claude-sonnet-4-6', '4': 'claude-sonnet-4-6', '5': 'claude-opus-4-8' } } };
+check('riskToModel: risk 1 → Haiku (cheap tier)', () => {
+  const r = pickImplementerModel({ title: 'minor fix', goal: 'ui', risk: 1 }, CFG_RTM);
+  assert.equal(r.tier, 'cheap'); assert.equal(r.model, 'claude-haiku-4-5');
+  assert.match(r.reason, /riskToModel\[1\]/);
+});
+check('riskToModel: risk 2 → configurable fallback (Haiku by default)', () => {
+  const r = pickImplementerModel({ title: 'minor fix', goal: 'ui', risk: 2 }, CFG_RTM);
+  assert.equal(r.tier, 'cheap'); assert.equal(r.model, 'claude-haiku-4-5');
+});
+check('riskToModel: risk 3 → Sonnet (mid tier)', () => {
+  const r = pickImplementerModel({ title: 'feature', goal: 'product', risk: 3 }, CFG_RTM);
+  assert.equal(r.tier, 'mid'); assert.equal(r.model, 'claude-sonnet-4-6');
+  assert.match(r.reason, /riskToModel\[3\]/);
+});
+check('riskToModel: safety floor still wins over riskToModel (opusMinRisk=4, risk=5→Opus)', () => {
+  // risk 5 → safetyFloor fires → riskToModel is skipped
+  const r = pickImplementerModel({ title: 'risky', goal: 'product', risk: 5 }, CFG_RTM);
+  assert.equal(r.tier, 'strong'); assert.equal(r.model, 'claude-opus-4-8');
+});
+check('riskToModel: budget downgrade after riskToModel mapping (mid→cheap)', () => {
+  const r = pickImplementerModel({ title: 'feature', goal: 'product', risk: 3 }, CFG_RTM, { budgetAction: 'downgrade' });
+  assert.equal(r.tier, 'cheap');
+  assert.match(r.reason, /DOWNGRADE/);
+});
+
 // ── provider adapters ────────────────────────────────────────────────────────
 check('default adapter is claude; resolves logical tiers', () => {
   const a = getAdapter(CFG);

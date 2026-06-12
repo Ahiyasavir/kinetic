@@ -15,6 +15,7 @@
 
 import { createRoleRunner } from './runtime.mjs';
 import { runSelector } from './selector/index.mjs';
+import { runTester } from './tester/index.mjs';
 import { runImplementer } from './implementer/index.mjs';
 import { runReviewer } from './reviewer/index.mjs';
 import { runAuditor } from './auditor/index.mjs';
@@ -33,6 +34,7 @@ export function createCore(ctx) {
     clearHandoff: runner.clearHandoff,
     // high-level workflows: invoke a role and return its parsed handoff
     runSelector: (vars, model, opts) => runSelector(runner, vars, model, opts),
+    runTester: (vars, model) => runTester(runner, vars, model),
     runImplementer: (vars, model) => runImplementer(runner, vars, model),
     runReviewer: (vars, model) => runReviewer(runner, vars, model),
     runAuditor: (vars, model) => runAuditor(runner, vars, model),
@@ -43,6 +45,7 @@ export function createCore(ctx) {
 
 export { createRoleRunner, renderPrompt, extractJsonObject, readHandoff, clearHandoff } from './runtime.mjs';
 export { runSelector } from './selector/index.mjs';
+export { runTester } from './tester/index.mjs';
 export { runImplementer } from './implementer/index.mjs';
 export { runReviewer } from './reviewer/index.mjs';
 export { runAuditor } from './auditor/index.mjs';

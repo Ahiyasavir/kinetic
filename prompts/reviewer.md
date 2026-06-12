@@ -25,6 +25,7 @@ Four task classes, judged differently:
 - **maintenance** — tidy/fix without a feature change. Evidence gate, not product gate.
 - **migration** — schema/data move; evidence gate PLUS confirm existing data/behavior is preserved.
 
+{{PRIOR_LESSON_RULES}}
 ## How to review
 1. If **Policy.gitDiffRequired is true** (product): run `git diff {{INTEGRATION_BRANCH}}...HEAD` and read
    the actual diff. If **false** (engine/maintenance/migration): the diff WILL be empty because the work

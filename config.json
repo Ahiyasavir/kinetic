@@ -72,6 +72,23 @@
       "atomic", "transaction", "custom claim", "auth rules", "money", "payment"
     ],
     "haikuFirstRevision": true,
+    "goalTierOverride": {
+      "ui": "cheap",
+      "maintenance": "cheap",
+      "docs": "cheap",
+      "optimization": "mid",
+      "intelligence": "mid",
+      "reliability": "mid"
+    },
+    "_goalTierOverride_comment": "U-74 (2026-06-12): per-goal DEFAULT implementer tier, applied ONLY after the safety floor (risk>=opusMinRisk and opusKeywords still force 'strong' regardless). Steers non-critical work to the right cost tier: low-logic goals (ui/maintenance/docs) default to the cheapest model; engine-leaning goals (optimization/intelligence/reliability) default to mid (Sonnet). Anything genuinely risky still escalates via risk/keyword. Remove a key to fall back to the generic mid/cheap heuristic for that goal.",
+    "riskToModel": {
+      "1": "claude-haiku-4-5",
+      "2": "claude-haiku-4-5",
+      "3": "claude-sonnet-4-6",
+      "4": "claude-sonnet-4-6",
+      "5": "claude-opus-4-8"
+    },
+    "_riskToModel_comment": "U-56 (2026-06-12): direct risk-level → model mapping. Applied ONLY when the safety floor (opusMinRisk/opusKeywords/migration) has NOT fired, so truly risky tasks are never downgraded. risk≤1 → Haiku (fast+cheap; trivial/low-stakes work); risk=2 → configurable fallback (Haiku by default); risk≥3 → Sonnet for moderate tasks (opusMinRisk=4 escalates genuinely complex ones to Opus). Budget downgrade can still lower the mapped tier further when quota is depleting.",
     "_comment": "RISK-AWARE routing (2026-06-05): risk>=opusMinRisk OR an architectural opusKeyword -> Opus; everything else (low-risk polish/UI/reliability) -> Sonnet. Replaced the prior all-Opus alwaysOpusGoals policy that caused ~50 rate-limit pauses. haikuFirstRevision (2026-06-11): when a revision is triggered by a MECHANICAL validation failure (typecheck/lint/build) — not a reviewer logic objection — the FIRST retry is routed to Haiku (cheap+fast; trivial type/import/syntax fixes resolve ≈90% of compile breaks), escalating back to the task's real tier only if Haiku fails. Set false to disable."
   },
   "consensusAudit": {
@@ -92,7 +109,9 @@
     "minProductShare": 0.7,
     "minProductTasks": 5,
     "maxAttemptsBeforeBlock": 3,
-    "maxReviewFailAttempts": 2
+    "maxReviewFailAttempts": 2,
+    "lessonMatchThreshold": 0.35,
+    "_lessonMatchThreshold_comment": "U-77: Jaccard cutoff for matching a candidate task to a past failure (lessons.json). Lowered 0.6→0.35 because the sparse keyword sets in lessons rarely overlap ≥0.6, so the pre-flight de-risk almost never fired. 0.35 surfaces genuinely-similar prior failures while staying above noise."
   },
   "durationDays": 3650,
   "phase": "hardening",
@@ -188,7 +207,8 @@
   },
   "telemetry": {
     "enabled": true,
-    "endpoint": null,
+    "endpoint": "https://kinetic-telemetry.SUBDOMAIN.workers.dev/ingest",
+    "_endpoint_comment": "replace SUBDOMAIN after running: cd autopilot/telemetry-receiver && wrangler deploy",
     "batchSize": 50,
     "flushIntervalMs": 60000,
     "_comment": "Decoupled engine telemetry (U-36), resolved by autopilot/config-loader.mjs → { telemetry } and consumed by autopilot/lib/telemetry.mjs. Reports the AUTOPILOT ENGINE's own health/metrics (cycle duration, token count, error count, an event log) INDEPENDENTLY of the RushPoint product — supervisor.mjs + watchdog.mjs emit events at startup / cycle-start / cycle-end / on-error. State persists in state.json under framework.telemetry (separate from the app tier). `enabled:false` makes every recorder a no-op (disable without touching supervisor logic); set `endpoint` to a monitoring URL to batch events out, else they buffer locally. Omit this whole block to default to disabled (backward compatible)."
@@ -201,8 +221,10 @@
   },
   "disableDependencyOptimization": false,
   "_disableDependencyOptimization_comment": "U-45 safety valve. Set to true to revert to full-file loading in the Selector (skips the AST-based dep-graph filter). Useful for debugging or comparing token counts. False (default) = optimization active when a contextProvider is enabled.",
+  "enableSelectorDiffMode": true,
+  "_enableSelectorDiffMode_comment": "U-52 git diff optimization. Set to true (default) to reduce Selector context token usage by passing git diffs of modified files instead of full file contents. Set to false to revert to full-file context (disables the optimization for debugging/comparison).",
   "profileSelectorTokens": false,
-  "_profileSelectorTokens_comment": "U-45 measurement flag. Set to true to log before/after file counts for every Selector context-map filter pass (stdout, [dep-opt] prefix). Enables benchmarking the token-reduction claim on a representative 5-file feature.",
+  "_profileSelectorTokens_comment": "U-45/U-52 measurement flag. Set to true to log token-reduction metrics (stdout, [dep-opt] and [U-52] prefixes). Enables benchmarking dep-graph filtering + diff-mode savings on a representative run.",
   "contextProvider": {
     "enabled": false,
     "interface": "core/context-provider.mjs#ContextProviderInterface",
@@ -216,6 +238,12 @@
   "handoff": {
     "context": "rushpoint-kinetic-topo",
     "_comment": "Per-role handoff file context tag (U-34), resolved by autopilot/lib/handoff-paths.mjs. `context` is inserted before the extension of every handoff basename (selection.json -> selection-rushpoint-kinetic-topo.json; same for implementation/review/audit) so two project contexts that share a handoff dir never overwrite each other. Omit `context` to derive it from the repo+goal slug (the same identity used by locks/budgets); omit the whole block (and have no derivable repo/goal) to keep the legacy generic 'selection.json' basenames (backward compatible). See autopilot/HANDOFF_STRUCTURE.md."
+  },
+  "scanner": {
+    "enabled": true,
+    "runDuringIdleTime": true,
+    "ignorePaths": ["node_modules", "dist", "build", "coverage", "target", ".next", ".vite"],
+    "_comment": "Proactive Scanner agent (U-57) — runs during idle time between cycles to detect tech-debt patterns (unused imports, nested logic, missing error handling, hardcoded paths, magic numbers, dead code). Generates Markdown tickets into autopilot/suggestions/ for user approval. enabled:false disables the scanner. runDuringIdleTime:true activates idle-time execution between cycles. ignorePaths lists directory segments to skip during analysis."
   },
   "locks": {
     "watchdog": "{repoGoal}.watchdog.lock",

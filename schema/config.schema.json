@@ -91,7 +91,10 @@
       "patternProperties": { "^_": {} },
       "properties": {
         "opusMinRisk":  { "type": "integer", "minimum": 0, "description": "Minimum risk score that routes to the high-tier model." },
-        "opusKeywords": { "type": "array", "items": { "type": "string" }, "description": "Task-title keywords that force the high-tier model regardless of risk." }
+        "opusKeywords": { "type": "array", "items": { "type": "string" }, "description": "Task-title keywords that force the high-tier model regardless of risk." },
+        "haikuFirstRevision": { "type": "boolean", "description": "Route the first MECHANICAL revision retry (typecheck/lint/build failure) to the cheap tier before escalating." },
+        "goalTierOverride": { "type": "object", "additionalProperties": { "type": "string", "enum": ["cheap", "mid", "strong"] }, "description": "U-74: per-goal default implementer tier, applied only after the risk/keyword safety floor." },
+        "riskToModel": { "type": "object", "additionalProperties": { "type": "string" }, "description": "U-56: direct risk-level (keys '1'–'5') to concrete model ID mapping. Applied only when the safety floor (opusMinRisk/opusKeywords/migration) has NOT fired." }
       }
     },
     "scoring": {
@@ -105,7 +108,8 @@
         "minProductShare":        { "type": "number", "minimum": 0, "maximum": 1, "description": "Minimum fraction of selected tasks that must be product-class." },
         "minProductTasks":        { "type": "integer", "minimum": 0, "description": "Minimum absolute count of product-class tasks in selection." },
         "maxAttemptsBeforeBlock": { "type": "integer", "minimum": 1, "description": "Attempts before a task is blocked." },
-        "maxReviewFailAttempts":  { "type": "integer", "minimum": 1, "description": "Allowed review failures before a task is escalated." }
+        "maxReviewFailAttempts":  { "type": "integer", "minimum": 1, "description": "Allowed review failures before a task is escalated." },
+        "lessonMatchThreshold":   { "type": "number", "minimum": 0, "maximum": 1, "description": "U-77: Jaccard cutoff for matching a candidate task to a past failure (lessons.json)." }
       }
     },
     "durationDays": {

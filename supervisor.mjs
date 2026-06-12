@@ -9,7 +9,7 @@
 //   node autopilot/supervisor.mjs status   # print a snapshot without touching the loop
 
 import { readFile, writeFile } from 'node:fs/promises';
-import { existsSync, readFileSync, readdirSync, statSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, rmSync, appendFileSync } from 'node:fs';
 import {
   computeVelocityFactor, effectivePerDay, extractKeywords, bestLessonMatch, loadLessons, saveLessons
 } from './lib/learn.mjs';
@@ -54,14 +54,19 @@ import { resolveModelForRole, getProviderForRole } from './core/providers.mjs';
 import { nonLlmAudit } from './lib/verify.mjs';
 // Intelligence Efficiency Layer (P1–P3) — deterministic helpers layered on top of the existing systems.
 import { compileContext, contextHintBlock } from './lib/context-compiler.mjs';
+import { loadRuleLessons, filterForImplementer, filterForReviewer, formatLessonsBlock, filterFailureLessonsByFiles, formatFailureLessonsBlock } from './lib/lessons-injector.mjs';
 import { buildDependencyGraph } from './core/dependencies.mjs';
 import { selectorFingerprint, getCachedDecision, putCachedDecision, cacheHitRate } from './lib/fingerprint-cache.mjs';
 import { recordCycleCost, improvedEstimate, costKey } from './lib/cost-learning.mjs';
+import { getModifiedFilesDiffs, formatDiffsForContext } from './lib/select.mjs';
 // Multi-workspace foundation: the active workspace bundles root + state/queue/lock/budget/validation
 // scope; the default workspace equals the engine's existing resolved values (behavior-preserving).
 import { resolveActiveWorkspace } from './lib/workspace-registry.mjs';
 import { describeWorkspace, assertWithinBoundary } from './lib/workspace.mjs';
 import { compileFilters } from './lib/workspace-profile.mjs';
+// Proactive Scanner agent (U-57) — analyzes codebase for tech-debt during idle time
+import { runScanner } from './agents/scanner.mjs';
+import { scanner as scannerConfig, scannerResolvedLine } from './config-loader.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -104,6 +109,8 @@ const STATE_DIR = WORKSPACE.stateDir;                             // isolated pe
 const HANDOFF_DIR = WORKSPACE.queuePaths.handoffDir;
 const STATE_PATH = WORKSPACE.statePath;
 const LESSONS_PATH = WORKSPACE.queuePaths.lessonsPath;
+// Rule lessons for prompt injection (U-48): hand-crafted guidelines injected into implementer/reviewer.
+const LESSONS_RULES_PATH = path.join(STATE_DIR, 'lessons-rules.json');
 // P5 — persistent validation cache file (survives restarts; auto-invalidated by tree-signature+config).
 const VALIDATION_CACHE_PATH = WORKSPACE.queuePaths.validationCacheFile;
 const PROMPT_DIR = path.join(__dirname, 'prompts');               // engine-shared (NOT per-workspace)
@@ -447,6 +454,7 @@ function shouldRunAuditor(task, cls, config) {
 async function runCycle(state) {
   state.cycle += 1;
   state.stats.cyclesRun += 1;
+  const cycleStartMs = Date.now();
   await core.clearHandoff();
   resetCycleUsage(); // start a fresh per-cycle usage tally (folded into state.usage on success)
   log(`===== Cycle ${state.cycle} =====`);
@@ -534,17 +542,31 @@ async function runCycle(state) {
     // U-45 dep-graph filter in runSelector so it prunes context to only engine-relevant files.
     // Falls back gracefully when the scan returns nothing (first call on a fresh install).
     const localMaps = config.disableDependencyOptimization === true ? null : buildLocalContextMaps();
+
+    // U-52: Fetch git diffs for modified files (if enabled) to reduce Selector context token usage.
+    // Falls back to empty diffs if git is unavailable or disabled.
+    const enableDiffMode = config.enableSelectorDiffMode !== false; // default: enabled
+    const { diffs, stats, totalBytes } = await getModifiedFilesDiffs(GIT_ROOT, { enableDiffMode });
+    const diffsBlock = formatDiffsForContext(diffs, stats);
+    if (diffsBlock && config.profileSelectorTokens) {
+      console.log(`[U-52] Selector diffs: ${Object.keys(diffs).length} modified files, ${totalBytes} bytes`);
+    }
+
+    const selectorVars = {
+      CANDIDATES: fmtRanked(ranked) || '(backlog empty)',
+      WEAK_BACKLOG: weakNote,
+      // Pass the FULL done/blocked history (titles only) so the selector never re-proposes an old
+      // feature once the lists grow past a few dozen items over a long run.
+      DONE: fmtTasks(state.queues.done, 300),
+      BLOCKED: fmtTasks(state.queues.blocked, 300),
+      NEXT_ID: nextTaskId(state),
+      HANDOFF_PATH: handoffRel('selection.json'),
+      // U-52: Inject diffs block (or empty string if no diffs) so the template always has the var.
+      MODIFIED_FILES_CONTEXT: diffsBlock || ''
+    };
+
     selection = await core.runSelector(
-      {
-        CANDIDATES: fmtRanked(ranked) || '(backlog empty)',
-        WEAK_BACKLOG: weakNote,
-        // Pass the FULL done/blocked history (titles only) so the selector never re-proposes an old
-        // feature once the lists grow past a few dozen items over a long run.
-        DONE: fmtTasks(state.queues.done, 300),
-        BLOCKED: fmtTasks(state.queues.blocked, 300),
-        NEXT_ID: nextTaskId(state),
-        HANDOFF_PATH: handoffRel('selection.json')
-      },
+      selectorVars,
       undefined,
       {
         disableDependencyOptimization: config.disableDependencyOptimization === true,
@@ -655,12 +677,15 @@ async function runCycle(state) {
   task.score = taskScore.total;
   log(`Selected ${task.id} (score ${taskScore.total}, ${isCleanup(task) ? 'cleanup' : 'product'}): ${task.title}`);
 
-  // PRE-FLIGHT FAILURE MATCH: if this task closely resembles a past failure (Jaccard ≥ 0.6 over
+  // PRE-FLIGHT FAILURE MATCH: if this task resembles a past failure (Jaccard ≥ config threshold over
   // keywords), escalate its engineering risk +1 (capped at 5 — feeds model routing below) and inject
   // the prior failure's avoid-hints into the implementer prompt so it sidesteps the known trap.
+  // U-77: threshold is config-driven (scoring.lessonMatchThreshold, default 0.35) — the prior 0.6 was
+  // too high for the sparse keyword sets in lessons.json, so the de-risk almost never fired.
   let lessonsBlock = '';
   {
-    const match = bestLessonMatch(taskKeywords(task), loadLessons(LESSONS_PATH, log), 0.6);
+    const lessonThreshold = config.scoring?.lessonMatchThreshold ?? 0.35;
+    const match = bestLessonMatch(taskKeywords(task), loadLessons(LESSONS_PATH, log), lessonThreshold);
     if (match) {
       const before = Number(task.risk) || 3;
       task.risk = Math.min(5, before + 1);
@@ -707,7 +732,7 @@ async function runCycle(state) {
   task.implementerModel = route.model;
   task.implementerTier = route.tier;
   task.implementerReason = route.reason;
-  log(`Implementer model → ${(route.tierLabel || route.tier).toUpperCase()} (${route.model}) — ${route.reason}`);
+  log(`[MODEL: ${route.tierLabel || route.tier}] Implementer model → ${(route.tierLabel || route.tier).toUpperCase()} (${route.model}) — ${route.reason}`);
 
   // 2) SNAPSHOT + IMPLEMENT/REVIEW loop -----------------------------------
   // Work happens directly on the integration branch; we snapshot HEAD and, on any non-approval,
@@ -745,20 +770,50 @@ async function runCycle(state) {
   // tools), so it can only save exploration tokens, never hide a needed file. Best-effort: a failure
   // (no git, empty scan) yields an empty hint and the prompt is unchanged.
   let contextHint = '';
+  let activeFilePaths = [];
   try {
     const compiled = compileContext({ task, repoRoot: GIT_ROOT, maxFiles: 8 });
     contextHint = contextHintBlock(compiled);
+    activeFilePaths = Array.isArray(compiled.files) ? compiled.files.map((f) => f.path) : [];
     if (compiled.files.length) {
       log(`Context compiler: ${compiled.files.length}/${compiled.metrics.scanned} files relevant ` +
         `(~${compiled.metrics.reductionPct}% smaller than the candidate pool) — ${compiled.files.slice(0, 4).map((f) => f.path).join(', ')}…`);
     }
   } catch (e) { log('context compiler skipped:', e.message); }
 
+  // U-48: Load rule lessons once per cycle and pre-compute the two filtered blocks.
+  // Store the filtered arrays so we can log matched IDs and build the blocks separately.
+  const ruleLessons = loadRuleLessons(LESSONS_RULES_PATH, log);
+  const implRuleLessons = filterForImplementer(ruleLessons, activeFilePaths);
+  const reviewRuleLessons = filterForReviewer(ruleLessons, task);
+
+  // Also inject failure lessons (lessons.json) matched by active-file overlap — a complementary
+  // signal to the keyword-Jaccard match above (which finds the SINGLE best-matching past failure).
+  // File-based matching finds ALL past failures that touched the same files, regardless of keyword sim.
+  const allFailureLessons = loadLessons(LESSONS_PATH, log);
+  const fileMatchedFailures = filterFailureLessonsByFiles(allFailureLessons, activeFilePaths);
+
+  if (implRuleLessons.length) {
+    log(`Rule lessons [implementer]: ${implRuleLessons.length} matched — ${implRuleLessons.map((l) => l.id).join(', ')}`);
+  }
+  if (reviewRuleLessons.length) {
+    log(`Rule lessons [reviewer]: ${reviewRuleLessons.length} matched — ${reviewRuleLessons.map((l) => l.id).join(', ')} (goal: ${task.goal || '?'}, class: ${task.class || '?'})`);
+  }
+  if (fileMatchedFailures.length) {
+    log(`File-matched failure lessons: ${fileMatchedFailures.length} — ${fileMatchedFailures.map((l) => l.id).join(', ')} (files: ${activeFilePaths.slice(0, 4).join(', ')})`);
+  }
+
+  const APPLICABLE_LESSONS =
+    formatLessonsBlock(implRuleLessons, 'Applicable lessons from past cycles:') +
+    formatFailureLessonsBlock(fileMatchedFailures, 'File-matched past failure warnings:');
+  const PRIOR_LESSON_RULES = formatLessonsBlock(reviewRuleLessons, 'Prior lesson rules (apply to this review):');
+
   let verdict = 'reject';
   let review = null;
   let impl = null;
   let attempt = 0;
   let validation = { ok: false, summary: 'not run' };
+  let validationElapsedMs = 0; // U-49: last validation duration (ms); recorded in history for cycle-time analysis
   let autoFixResult = { fixed: false, summary: 'not run' };
   // CROSS-CYCLE MEMORY: if this task already failed review/validation in an EARLIER cycle, seed the
   // implementer's first attempt with WHY it failed last time — so it fixes the known issue up front
@@ -775,6 +830,44 @@ async function runCycle(state) {
     log(`↺ Seeding implementer with prior-cycle failure memory (cycle ${f.cycle}).`);
   }
 
+  // 2) TEST GENERATION PHASE (U-58) ----------------------------------------
+  // Before implementation, generate comprehensive Jest tests from the task specification.
+  // These tests establish a quality gate at spec-time and the implementer must pass them.
+  let tester = null;
+  let testFilePath = null;
+  const testerStartTime = Date.now();
+  try {
+    const testerVars = {
+      TASK_JSON: taskJson,
+      TARGET_FILES: JSON.stringify(activeFilePaths.slice(0, 8).map(p => ({ path: p })) || []),
+      PROJECT_CONTEXT: `Task goal: ${task.goal}\nTask class: ${taskClass}\nTask acceptance criteria:\n${(task.acceptanceCriteria || []).map((c) => `  - ${c}`).join('\n')}`,
+      CYCLE_NUM: String(state.cycle),
+      HANDOFF_PATH: handoffRel('tester.json')
+    };
+    log(`Tester starting — generating test suite for ${task.id}…`);
+    tester = await core.runTester(testerVars);
+    const testerDurationMs = Date.now() - testerStartTime;
+    if (tester && tester.testFilePath) {
+      testFilePath = tester.testFilePath;
+      log(`✓ Tester generated ${tester.testCount || 0} test cases: ${testFilePath} (${(testerDurationMs / 1000).toFixed(1)}s)`);
+      // Record tester cost in cycle history for analysis
+      if (state.history) {
+        const latestCycle = state.history[state.history.length - 1];
+        if (latestCycle) {
+          latestCycle.telemetry = latestCycle.telemetry || {};
+          latestCycle.telemetry.testerDurationMs = testerDurationMs;
+          latestCycle.telemetry.testCount = tester.testCount || 0;
+        }
+      }
+    } else {
+      log('⚠ Tester produced no test file (non-fatal, proceeding with implementation)');
+    }
+  } catch (err) {
+    const testerDurationMs = Date.now() - testerStartTime;
+    log(`⚠ Tester failed (non-fatal): ${err.message} (${(testerDurationMs / 1000).toFixed(1)}s)`);
+    // Continue with implementation even if test generation fails — don't block the cycle
+  }
+
   // Tracks whether the PREVIOUS iteration's failure was mechanical (failing validation) vs a reviewer
   // judgement — drives the Haiku-first revision triage on the next attempt.
   let lastFailureMechanical = false;
@@ -788,6 +881,7 @@ async function runCycle(state) {
       if (triage) { attemptModel = triage.model; log(`↳ ${triage.reason}`); }
     }
     // IMPLEMENT (model chosen by risk/category routing above, or Haiku-triaged for a mechanical retry)
+    log(`Implementer starting (attempt ${attempt + 1})…`);
     impl = await core.runImplementer({
       TASK_JSON: taskJson,
       TASK_CLASS: taskClass,
@@ -795,6 +889,8 @@ async function runCycle(state) {
       REVISION_BLOCK: revisionBlock,
       CONTEXT_HINT: contextHint,
       PROFILE_RULES: WORKSPACE.profile.promptProfile || '',
+      APPLICABLE_LESSONS,
+      TEST_FILE_PATH: testFilePath || '',
       HANDOFF_PATH: handoffRel('implementation.json')
     }, attemptModel);
 
@@ -804,6 +900,30 @@ async function runCycle(state) {
     await git.checkoutIntegrationKeepingWork(GIT_ROOT, config.git.integrationBranch);
     const autoCommitted = await git.commitAllIfDirty(GIT_ROOT, `${config.git.commitPrefix}: ${task.id} ${task.title}`);
     if (autoCommitted) log('Captured implementer changes on integration branch.');
+
+    // CHECK TEST RESULTS (U-58): if the tester phase generated tests and the implementer reports
+    // test failures, block cycle advancement. Test failures are treated like validation failures.
+    if (impl && impl.testResults && testFilePath) {
+      const testResult = impl.testResults;
+      if (testResult.passed === false) {
+        log(`⚠ TEST FAILURE DETECTED: ${testResult.filePath || testFilePath}`);
+        log(`  ${testResult.output || 'Tests failed (no details provided)'}`);
+        // Append test failure to validation so it blocks the cycle like a real validation error would
+        if (!validation) validation = { ok: false, summary: 'tests not run', results: [] };
+        validation.ok = false;
+        if (!validation.results) validation.results = [];
+        validation.results.push({
+          name: 'tests',
+          ok: false,
+          tail: `Test suite FAILED. Output:\n${testResult.output || 'No output provided'}`
+        });
+        if (validation.summary && !validation.summary.includes('FAIL')) {
+          validation.summary += ' · TEST FAILURE';
+        }
+      } else if (testResult.passed === true) {
+        log(`✓ Tests PASSED: ${testFilePath} (${testResult.output || ''})`);
+      }
+    }
 
     // AUTO-FIX (U-46) — run eslint --fix + import-sort before validation to eliminate trivial issues
     autoFixResult = await runAutoFixes(wsConfig, GIT_ROOT, git, log);
@@ -819,10 +939,78 @@ async function runCycle(state) {
       log(`Auto-fix attempted: ${autoFixResult.summary}${errorDelta}`);
     }
 
-    // VALIDATE (deterministic) — includes typecheck + admin build (required) + lint-regression guard
-    log('Running validation…');
-    validation = await runValidation(wsConfig, GIT_ROOT, lintBaseline, { cacheFile: VALIDATION_CACHE_PATH });
-    log(`Validation: ${validation.summary}`);
+    // VALIDATE + PROMPT-DRAFT (parallel) — U-49: validation (typecheck/build/lint) is spawned as a
+    // background Promise so the supervisor can pre-draft the next task selection in parallel, cutting
+    // cycle latency by roughly the selector-call time (~30–90 s) on validation-bound cycles.
+    // runValidation uses exec() internally (I/O-bound child processes) so background Promise execution
+    // is equivalent to a worker thread for this workload — the main event loop is free while the OS
+    // runs the toolchain. Strict sequencing is preserved: validation MUST complete before the reviewer
+    // or any subsequent Implementer invocation (the await below enforces this invariant).
+    const validationStartTs = Date.now();
+    log('Validation started (background)…');
+    const validationPromise = runValidation(wsConfig, GIT_ROOT, lintBaseline, { cacheFile: VALIDATION_CACHE_PATH });
+
+    // Pre-draft next-task selector in parallel with validation (attempt 0 only — on revision retries
+    // the current task is re-attempted, not advanced, so pre-drafting the NEXT task would be stale).
+    if (attempt === 0) {
+      try {
+        // Simulate the next cycle's queue state: current task will move from in-progress → done.
+        // task is already removed from backlog (line ~686); we only need to add it to done.
+        const simDone = [...state.queues.done, task];
+        const simState = { ...state, queues: { ...state.queues, done: simDone }, current: null };
+        const simOnCooldown = (t) => !t.userRequested && t.cooldownUntilCycle && simState.cycle < t.cooldownUntilCycle;
+        const simSelectable = simState.queues.backlog.filter((t) => !simOnCooldown(t));
+        const simDoneIds = new Set(simDone.map((t) => String(t.id)));
+        const simBase = simSelectable.length ? simSelectable : simState.queues.backlog;
+        const simGate = selectablePool(simBase, simDoneIds, effectiveTaskPriority);
+        const simPool = simGate.pool.length ? simGate.pool : simBase;
+        const nextSelFp = selectorFingerprint(simState, simPool);
+        if (!getCachedDecision(state, nextSelFp) && simPool.length > 0) {
+          log('Pre-drafting next-task selector in parallel with validation…');
+          const draftTs = Date.now();
+          const simRanked = rankBacklog(simPool, config);
+          const localMaps = config.disableDependencyOptimization === true ? null : buildLocalContextMaps();
+
+          // U-52: Fetch git diffs for next cycle's selection context.
+          const enableDiffMode = config.enableSelectorDiffMode !== false;
+          const { diffs, stats } = await getModifiedFilesDiffs(GIT_ROOT, { enableDiffMode });
+          const diffsBlock = formatDiffsForContext(diffs, stats);
+
+          const nextSelectorVars = {
+            CANDIDATES: fmtRanked(simRanked) || '(backlog empty)',
+            WEAK_BACKLOG: weakNote,
+            DONE: fmtTasks(simDone, 300),
+            BLOCKED: fmtTasks(simState.queues.blocked, 300),
+            NEXT_ID: nextTaskId(simState),
+            HANDOFF_PATH: handoffRel('selection.json'),
+            MODIFIED_FILES_CONTEXT: diffsBlock || ''
+          };
+
+          const nextSel = await core.runSelector(
+            nextSelectorVars,
+            undefined,
+            {
+              disableDependencyOptimization: config.disableDependencyOptimization === true,
+              profileSelectorTokens: config.profileSelectorTokens === true,
+              contextMaps: localMaps || undefined,
+            }
+          );
+          if (nextSel?.selected) {
+            putCachedDecision(state, nextSelFp, nextSel, { at: nowIso() });
+            log(`Next-task pre-draft complete (${((Date.now() - draftTs) / 1000).toFixed(1)}s) → ${nextSel.selected.id || nextSel.selected.title}`);
+          }
+        }
+      } catch (e) {
+        log(`Next-task pre-draft skipped (non-fatal): ${e.message}`);
+      }
+    }
+
+    // Await validation — must complete before reviewer and before any next Implementer invocation.
+    // If validation fails: !validation.ok → the while-loop revise/retry branch applies; Implementer
+    // is never invoked again on a failed-validation attempt (verdict+validation guards below).
+    validation = await validationPromise;
+    validationElapsedMs = Date.now() - validationStartTs;
+    log(`Validation (${(validationElapsedMs / 1000).toFixed(1)}s): ${validation.summary}`);
     // U-46: Explicit reporting of auto-fixed vs AI-resolved errors
     if (autoFixResult && autoFixResult.errorsFixed !== null) {
       const aiRequired = autoFixResult.errorsAfter || 0;
@@ -846,6 +1034,7 @@ async function runCycle(state) {
       IMPL_REPORT: JSON.stringify(impl || { summary: 'no handoff written' }, null, 2),
       VALIDATION: validation.summary + '\n' + validation.results.map((r) => `${r.name}: ${r.ok ? 'ok' : r.tail}`).join('\n'),
       INTEGRATION_BRANCH: config.git.integrationBranch,
+      PRIOR_LESSON_RULES,
       HANDOFF_PATH: handoffRel('review.json')
     });
     verdict = review?.verdict || 'reject';
@@ -1026,13 +1215,19 @@ async function runCycle(state) {
     }
   }
 
-  // FAILURE LEARNING: capture a lesson when the task got blocked, was rolled back (not approved), or
-  // churned through ≥2 revisions — so a future similar task is flagged + de-risked at pre-flight.
+  // FAILURE LEARNING: capture a lesson when the task got blocked, was rolled back (not approved),
+  // churned through ≥2 revisions, or was approved-but-undelivered and re-queued — so a future similar
+  // task is flagged + de-risked at pre-flight.
+  // U-76: also learn from re-queued outcomes. 're-queued-with-memory' is already captured below via the
+  // !approved → 'rollback' branch; the gap was 're-queued-smaller' (approved but undelivered, status
+  // back to 'backlog', often <2 revisions) which previously recorded nothing despite being a real,
+  // repeatable failure mode (8.8% of cycles). recordLesson is idempotent per (taskId, failureType).
   {
     const revisionCount = attempt;
     let failureType = null;
     if (task.status === 'blocked') failureType = 'blocked';
     else if (!approved) failureType = 'rollback';
+    else if (outcome === 're-queued-smaller') failureType = 'undelivered';
     else if (revisionCount >= 2) failureType = 'high-revision';
     if (failureType) recordLesson(task, { failureType, revisionCount, impl, validation, review });
   }
@@ -1056,7 +1251,38 @@ async function runCycle(state) {
 
   // record + persist
   state.current = null;
-  state.history.push({ cycle: state.cycle, taskId: task.id, title: task.title, outcome, ts: nowIso() });
+  // U-75: enrich the history entry with this cycle's REAL cost + duration + model tier fingerprint, so
+  // post-hoc analysis (backlog cost forecast, per-goal cost, the telemetry dashboard) can read it
+  // straight from state without re-deriving. Read _cycleUsage while it's still live (foldCycleUsage
+  // clears it later, back in the main loop). All fields null-safe if usage wasn't recorded this cycle.
+  state.history.push({
+    cycle: state.cycle, taskId: task.id, title: task.title, outcome, ts: nowIso(),
+    goal: task.goal ?? null,
+    risk: task.risk ?? null,
+    modelTier: route?.tierLabel ?? null,
+    model: route?.model ?? null,
+    durationMs: Date.now() - cycleStartMs,
+    inputTokens: _cycleUsage?.inputTokens ?? null,
+    outputTokens: _cycleUsage?.outputTokens ?? null,
+    cacheReadTokens: _cycleUsage?.cacheReadTokens ?? null,
+    costUsd: _cycleUsage?.costUsd ?? null,
+    revisions: attempt,
+    validationMs: validationElapsedMs || null, // U-49: tracks validation duration to measure parallelism gain
+  });
+  // U-56: accumulate per-model usage in app.stats.modelUsage for cost breakdown by model tier.
+  if (route?.tierLabel) {
+    if (!state.stats.modelUsage) state.stats.modelUsage = {};
+    const mk = route.tierLabel; // 'haiku' | 'sonnet' | 'opus'
+    if (!state.stats.modelUsage[mk]) {
+      state.stats.modelUsage[mk] = { model: route.model, cycles: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 };
+    }
+    const ms = state.stats.modelUsage[mk];
+    ms.model = route.model; // keep the concrete model id current
+    ms.cycles += 1;
+    ms.inputTokens += _cycleUsage?.inputTokens ?? 0;
+    ms.outputTokens += _cycleUsage?.outputTokens ?? 0;
+    ms.costUsd += _cycleUsage?.costUsd ?? 0;
+  }
   await appendDecision(STATE_DIR, {
     cycle: state.cycle, ts: nowIso(), taskId: task.id, title: task.title, goalPhase: task.goal,
     rationale: task.rationale, downgradedFrom: task.downgradedFrom, validation: validation.summary,
@@ -1074,7 +1300,26 @@ async function runCycle(state) {
     notes: [impl?.notes, review?.riskNotes].filter(Boolean).join(' | ')
   });
   await writeMirrors(STATE_DIR, state);
+  recordEvent('cycle-summary', {
+    cycle: state.cycle,
+    outcome,
+    taskId: task.id,
+    taskGoal: task.goal ?? null,
+    taskRisk: task.risk ?? null,
+    taskClass: task.class ?? taskClass ?? null,
+    modelTier: route?.tierLabel ?? null,
+    blockReason: task.blockReason ?? null,
+    durationMs: Date.now() - cycleStartMs,
+    inputTokens: _cycleUsage?.inputTokens ?? null,
+    outputTokens: _cycleUsage?.outputTokens ?? null,
+    cacheReadTokens: _cycleUsage?.cacheReadTokens ?? null,
+    costUsd: _cycleUsage?.costUsd ?? null,
+    revisionCount: attempt,
+    validationPassed: validation?.ok ?? null,
+    projectId: config.profile ?? 'unknown',
+  });
   await saveState(STATE_PATH, state);
+  await flushTelemetry().catch(() => {});
   log(`Cycle ${state.cycle} → ${outcome}`);
   return { outcome };
 }
@@ -1196,7 +1441,21 @@ async function paceForWeeklyBudget(state) {
   // AIMD adaptive interval: self-tunes per observed rate-limit pressure.
   // Falls back to the legacy maxCyclesPerDay floor so the config cap is still honoured.
   const legacySpacingMs = Math.round(86400000 / perDay);
-  const minSpacingMs = Math.max(legacySpacingMs, u.adaptiveIntervalMs || ADAPTIVE_INITIAL_MS);
+  // U-72: decouple the rate-limit BACKOFF (adaptiveIntervalMs) from the business CADENCE
+  // (legacySpacingMs). adaptiveIntervalMs ratchets up ×2 per real 429 and recovers only ×0.90 per
+  // success, so after a burst of rate-limits it stays pinned near its 60-min ceiling and strands an
+  // otherwise-healthy, well-under-budget loop there for dozens of cycles. The backoff should only
+  // govern pacing WHILE there is actual rate-limit pressure. When there is no active rate-limit streak
+  // AND velocity is under budget, (a) pace by the business cadence this cycle, and (b) decay the stored
+  // interval fast so it stops dominating future cycles too (and can't snap back to the full ceiling on
+  // the next minor blip). Behavior is unchanged under real pressure (consecutiveHits>0 or velocity>1).
+  const noRateLimitPressure = (state.rateLimit?.consecutiveHits || 0) === 0;
+  const healthyUnderBudget = noRateLimitPressure && velocityFactor <= 1.0;
+  if (healthyUnderBudget && (u.adaptiveIntervalMs || 0) > ADAPTIVE_MIN_MS) {
+    u.adaptiveIntervalMs = Math.max(ADAPTIVE_MIN_MS, Math.round(u.adaptiveIntervalMs * 0.5));
+  }
+  const effectiveAdaptiveMs = healthyUnderBudget ? ADAPTIVE_MIN_MS : (u.adaptiveIntervalMs || ADAPTIVE_INITIAL_MS);
+  const minSpacingMs = Math.max(legacySpacingMs, effectiveAdaptiveMs);
   if (u.lastCycleAt) {
     const tillReset = new Date(u.windowResetAt).getTime() - Date.now();
     let waitMs = Math.min(minSpacingMs - (Date.now() - new Date(u.lastCycleAt).getTime()), Math.max(0, tillReset));
@@ -1235,6 +1494,27 @@ async function recover(state) {
   }
   state.status = 'running';
   await saveState(STATE_PATH, state);
+}
+
+// ---------- proactive scanner (idle-time tech-debt analysis) ----------
+async function runIdleScanner(state, shouldScan) {
+  if (!shouldScan || !scannerConfig.enabled || !scannerConfig.runDuringIdleTime) return null;
+  try {
+    const suggestionsDir = path.join(REPO_ROOT, 'autopilot', 'suggestions');
+    const result = await runScanner({
+      repoRoot: REPO_ROOT,
+      suggestionsDir,
+      ignorePaths: scannerConfig.ignorePaths,
+      telemetry: { recordEvent }
+    });
+    if (result.ticketsGenerated > 0) {
+      log(`Scanner generated ${result.ticketsGenerated} tech-debt tickets (${result.filesScanned} files analyzed, ${result.ticketsDeduped} deduped)`);
+    }
+    return result;
+  } catch (err) {
+    log(`⚠️ Scanner error (non-fatal): ${err.message}`);
+    return null;
+  }
 }
 
 // ---------- top-level commands ----------
@@ -1396,6 +1676,7 @@ async function cmdRun() {
   log(budgetsResolvedLine());
   log(telemetryResolvedLine());
   log(apiPoolsResolvedLine());
+  log(scannerResolvedLine());
   if (keyRotationActive()) log(`Key rotation engaged → ${keyManager.snapshot().filter((k) => k.hasToken).length} live key(s); ${keyRotation.maxRetries} rotations/call before backoff.`);
   log(handoffResolvedLine());
   log(handoffSchemaResolvedLine());
@@ -1505,6 +1786,9 @@ async function cmdRun() {
     syncTelemetry(state);
     await saveState(STATE_PATH, state);
     await sleep(config.cycle.cooldownBetweenCyclesMs);
+    // Run idle-time scanner during cooldown (detects tech-debt patterns for background maintenance)
+    const noScanFlag = process.argv.includes('--no-scan') || process.env.KINETIC_NO_SCAN === '1';
+    await runIdleScanner(state, !noScanFlag);
   }
 
   state.status = 'done';
@@ -1583,6 +1867,91 @@ async function cmdResetBreaker() {
   log(`Circuit breaker reset (was: ${was}). Resume with: node autopilot/supervisor.mjs start`);
 }
 
+// List all pending tech-debt suggestions for user review/approval.
+//   node autopilot/supervisor.mjs list-suggestions
+async function cmdListSuggestions() {
+  const suggestionsDir = path.join(REPO_ROOT, 'autopilot', 'suggestions');
+  if (!existsSync(suggestionsDir)) {
+    log('No suggestions directory yet.');
+    return;
+  }
+  try {
+    const files = readdirSync(suggestionsDir);
+    const suggestions = files.filter((f) => f.endsWith('.md'));
+    if (suggestions.length === 0) {
+      log('No pending suggestions.');
+      return;
+    }
+    log(`${suggestions.length} tech-debt suggestion(s):`);
+    for (const file of suggestions.sort()) {
+      const filePath = path.join(suggestionsDir, file);
+      const content = readFileSync(filePath, 'utf8');
+      const titleMatch = content.match(/^# (.+)/m);
+      const title = titleMatch ? titleMatch[1] : '(untitled)';
+      log(`  • ${file} — ${title}`);
+    }
+    log(`\nApprove: node autopilot/supervisor.mjs approve-suggestion <filename>`);
+    log(`Dismiss: node autopilot/supervisor.mjs dismiss-suggestion <filename>`);
+  } catch (err) {
+    log(`Error listing suggestions: ${err.message}`);
+  }
+}
+
+// Approve a tech-debt suggestion: read it from autopilot/suggestions/ and move it to the inbox
+// as a new backlog task so it can be picked up by the next cycle.
+//   node autopilot/supervisor.mjs approve-suggestion <filename>
+async function cmdApproveSuggestion() {
+  const filename = process.argv[3];
+  if (!filename) {
+    log('Usage: node autopilot/supervisor.mjs approve-suggestion <filename>');
+    process.exit(1);
+  }
+  await ensureInbox(INBOX_DIR);
+  const suggestionsDir = path.join(REPO_ROOT, 'autopilot', 'suggestions');
+  const suggestionPath = path.join(suggestionsDir, filename);
+  if (!existsSync(suggestionPath)) {
+    log(`Suggestion not found: ${filename}`);
+    process.exit(1);
+  }
+  try {
+    const content = readFileSync(suggestionPath, 'utf8');
+    const file = await addInboxTask(INBOX_DIR, content);
+    rmSync(suggestionPath);
+    log(`✅ Approved: ${filename} → ${path.relative(REPO_ROOT, file)}`);
+  } catch (err) {
+    log(`Error approving suggestion: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// Dismiss a tech-debt suggestion: delete it from autopilot/suggestions/ to ignore it.
+//   node autopilot/supervisor.mjs dismiss-suggestion <filename>
+async function cmdDismissSuggestion() {
+  const filename = process.argv[3];
+  if (!filename) {
+    log('Usage: node autopilot/supervisor.mjs dismiss-suggestion <filename>');
+    process.exit(1);
+  }
+  const suggestionsDir = path.join(REPO_ROOT, 'autopilot', 'suggestions');
+  const suggestionPath = path.join(suggestionsDir, filename);
+  if (!existsSync(suggestionPath)) {
+    log(`Suggestion not found: ${filename}`);
+    process.exit(1);
+  }
+  try {
+    rmSync(suggestionPath);
+    const hashMatch = filename.match(/([a-f0-9]+)\.md$/);
+    if (hashMatch) {
+      const dismissedPath = path.join(suggestionsDir, '.dismissed');
+      appendFileSync(dismissedPath, hashMatch[1] + '\n', 'utf8');
+    }
+    log(`🗑️ Dismissed: ${filename}`);
+  } catch (err) {
+    log(`Error dismissing suggestion: ${err.message}`);
+    process.exit(1);
+  }
+}
+
 // Operator: reconcile state.json against the filesystem (disk is the source of truth). Dry-run by
 // default — prints what it WOULD do. Pass --apply to mutate, --dedupe to also remove backlog duplicates.
 //   node autopilot/supervisor.mjs reconcile            # report only
@@ -1635,8 +2004,11 @@ try {
   else if (cmd === 'reset-breaker') await cmdResetBreaker();
   else if (cmd === 'reconcile') await cmdReconcile();
   else if (cmd === 'verify') await cmdVerify();
+  else if (cmd === 'list-suggestions') await cmdListSuggestions();
+  else if (cmd === 'approve-suggestion') await cmdApproveSuggestion();
+  else if (cmd === 'dismiss-suggestion') await cmdDismissSuggestion();
   else if (cmd === 'run' || cmd === 'resume') await cmdRun();
-  else { log(`Unknown command "${cmd}". Use: start | stop | status | reset-breaker | reconcile [--apply] [--dedupe] | verify | add "task" | run | init | route | reprioritize`); process.exit(1); }
+  else { log(`Unknown command "${cmd}". Use: start | stop | status | reset-breaker | reconcile [--apply] [--dedupe] | verify | add "task" | run [--no-scan] | list-suggestions | approve-suggestion | dismiss-suggestion | init | route | reprioritize`); process.exit(1); }
 } catch (err) {
   const elapsedMs = Date.now() - supervisorStartedAt;
   const activeStep = cmd === 'run' ? 'main-loop' : `cmd-${cmd}`;

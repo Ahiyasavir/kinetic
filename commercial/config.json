@@ -65,12 +65,20 @@
     "implementerLowest": "claude-haiku-4-5"
   },
   "implementerRouting": {
-    "opusMinRisk": 3,
+    "opusMinRisk": 4,
     "opusKeywords": [
       "security", "firestore.rules", "firestore rules", "data model", "schema", "migration",
       "scoring", "score formula", "z-score", "matchmaking", "duel", "algorithm",
       "atomic", "transaction", "custom claim", "auth rules", "money", "payment"
     ],
+    "riskToModel": {
+      "1": "claude-haiku-4-5",
+      "2": "claude-haiku-4-5",
+      "3": "claude-sonnet-4-6",
+      "4": "claude-sonnet-4-6",
+      "5": "claude-opus-4-8"
+    },
+    "_riskToModel_comment": "U-56 (2026-06-12): direct risk-level → model mapping. Applied ONLY when the safety floor (opusMinRisk/opusKeywords/migration) has NOT fired. risk≤2 → Haiku (fast+cheap; trivial/low-stakes work); risk 3-4 → Sonnet when safety floor allows; risk 5 → Opus. Budget downgrade can still lower the mapped tier further when quota is depleting.",
     "_comment": "RISK-AWARE routing (2026-06-05): risk>=opusMinRisk OR an architectural opusKeyword -> Opus; everything else (low-risk polish/UI/reliability) -> Sonnet. Replaced the prior all-Opus alwaysOpusGoals policy that caused ~50 rate-limit pauses."
   },
   "scoring": {

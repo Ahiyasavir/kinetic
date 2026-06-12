@@ -49,6 +49,29 @@ export const config = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
 const CONFIG_DISPLAY = CONFIG_PATH.includes('commercial') ? 'autopilot/commercial/config.json' : 'autopilot/config.json';
 assertValidConfig(config, CONFIG_DISPLAY);
 
+// U-56: riskToModel runtime validation — keys must be numeric strings '1'–'5'; values must be
+// non-empty model ID strings; each value must be one of the model IDs declared in config.models
+// (so a typo fails loudly at startup instead of silently using the wrong model).
+{
+  const rtm = (config.implementerRouting || {}).riskToModel;
+  if (rtm && typeof rtm === 'object' && !Array.isArray(rtm)) {
+    const VALID_RISK_KEYS = new Set(['1', '2', '3', '4', '5']);
+    const knownModelIds = new Set(Object.values(config.models || {}).filter((v) => typeof v === 'string' && v));
+    for (const [key, modelId] of Object.entries(rtm)) {
+      if (key.startsWith('_')) continue; // allow _comment keys
+      if (!VALID_RISK_KEYS.has(String(key))) {
+        throw new Error(`${CONFIG_DISPLAY}: implementerRouting.riskToModel key "${key}" is invalid — must be a risk level 1–5`);
+      }
+      if (typeof modelId !== 'string' || !modelId.trim()) {
+        throw new Error(`${CONFIG_DISPLAY}: implementerRouting.riskToModel[${key}] must be a non-empty model ID string`);
+      }
+      if (knownModelIds.size > 0 && !knownModelIds.has(modelId)) {
+        throw new Error(`${CONFIG_DISPLAY}: implementerRouting.riskToModel[${key}] — unknown model ID "${modelId}" (not in config.models: ${[...knownModelIds].join(', ')})`);
+      }
+    }
+  }
+}
+
 // `_comment` keys in config.json are documentation only — never treat them as a path. `queues` is a
 // nested block resolved separately below (against the autopilot/ dir, not appRoot).
 const rawPaths = { ...config.paths };
@@ -160,6 +183,31 @@ export function autoFixResolvedLine() {
   return autoFix.enabled
     ? `config-loaded autoFix from config.json → enabled (lint: ${!!autoFix.lintFixCommand}, imports: ${!!autoFix.importSortCommand})`
     : 'config-loaded autoFix from config.json → disabled';
+}
+
+// Proactive Scanner configuration (U-57). Resolves the optional `scanner` block with safe defaults
+// so the scanner stays disabled unless explicitly enabled — omitting the block (or `enabled:false`)
+// keeps the scanner off (zero behavior change, fully backward compatible).
+const DEFAULT_SCANNER = {
+  enabled: false,
+  runDuringIdleTime: false,
+  ignorePaths: ['node_modules', 'dist', 'build', 'coverage', '.next', '.vite']
+};
+
+const rawScanner = { ...(config.scanner || {}) };
+delete rawScanner._comment; // documentation only — never treat as a scanner setting
+export const scanner = {
+  enabled: rawScanner.enabled ?? DEFAULT_SCANNER.enabled,
+  runDuringIdleTime: rawScanner.runDuringIdleTime ?? DEFAULT_SCANNER.runDuringIdleTime,
+  ignorePaths: Array.isArray(rawScanner.ignorePaths) ? rawScanner.ignorePaths : DEFAULT_SCANNER.ignorePaths
+};
+
+/** Startup confirmation that scanner config was loaded. */
+export function scannerResolvedLine() {
+  if (!scanner.enabled) {
+    return 'config-loaded scanner from config.json → disabled';
+  }
+  return `config-loaded scanner from config.json → enabled (idleTime=${scanner.runDuringIdleTime}, ignore=${scanner.ignorePaths.length} patterns)`;
 }
 
 // Per-project token budgets (U-33). Maps a projectId (repo+goal slug) to its independent limits so the

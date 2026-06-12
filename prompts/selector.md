@@ -56,6 +56,8 @@ Reliability (×3) + Product Risk (×2) + Cleanup Value (×1)** — so product wo
 {{CANDIDATES}}
 {{WEAK_BACKLOG}}
 
+{{MODIFIED_FILES_CONTEXT}}
+
 Recently completed (DO NOT repeat or re-propose):
 {{DONE}}
 

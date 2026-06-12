@@ -31,6 +31,7 @@ import { runAutoFixes } from './lib/auto-fix.mjs';
 import { writeMirrors, appendDecision, ensureDecisionLogHeader } from './lib/files.mjs';
 import { ingestInbox, addInboxTask, ensureInbox } from './lib/inbox.mjs';
 import { snapshotProtected } from './lib/protect.mjs';
+import { runTester } from './core/tester/index.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -468,6 +469,46 @@ async function runCycle(state) {
     rationale: task.rationale, downgradedFrom: task.downgradedFrom
   }, null, 2);
 
+  // 1.5) TESTER PHASE — generate unit tests before implementation ----
+  // Extract target files from implementation hints; read project context from CLAUDE.md
+  const targetFilesHint = (task.implementationHints || []).join(' ');
+  let projectContext = 'Project context not available.';
+  try {
+    const claudeMdPath = path.join(REPO_ROOT, 'CLAUDE.md');
+    if (existsSync(claudeMdPath)) {
+      projectContext = await readFile(claudeMdPath, 'utf8');
+    }
+  } catch { /* silent */ }
+
+  // Ensure cycle-specific state directory exists
+  const cycleStateDir = path.join(STATE_DIR, `cycle-${state.cycle}`);
+  await mkdir(cycleStateDir, { recursive: true });
+
+  // Generate tests
+  log('→ Generating test suite…');
+  const testerRes = await invokeRole('tester', {
+    TASK_JSON: taskJson,
+    TARGET_FILES: targetFilesHint || '(from implementation hints)',
+    PROJECT_CONTEXT: projectContext.slice(0, 4000), // Cap context to 4KB to save tokens
+    CYCLE_NUM: state.cycle,
+    HANDOFF_PATH: path.join('kinetic', 'state', 'handoff', 'tester.json').replaceAll('\\', '/')
+  });
+  const testerRes2 = await readHandoff('tester.json');
+
+  if (testerRes2 && testerRes2.testContent) {
+    // Write the test file to disk
+    const testFilePath = path.join(cycleStateDir, 'tests.mjs');
+    await writeFile(testFilePath, testerRes2.testContent, 'utf8');
+    task.testFilePath = testFilePath;
+    task.testCount = testerRes2.testCount || 0;
+    task.testCoverage = testerRes2.coverageSummary || '';
+    log(`✓ Generated ${task.testCount} test case(s): ${task.testCoverage}`);
+  } else {
+    log('⚠️  Tester produced no test handoff — proceeding without tests (non-fatal).');
+    task.testFilePath = null;
+  }
+  await saveState(STATE_PATH, state);
+
   let verdict = 'reject';
   let review = null;
   let impl = null;
@@ -486,6 +527,11 @@ async function runCycle(state) {
       (f.validation && !/PASS .*FAIL/.test(f.validation) ? `Validation then: ${f.validation}\n` : '') +
       `Address THIS specifically before anything else.\n\n`;
     log(`↺ Seeding implementer with prior-cycle failure memory (cycle ${f.cycle}).`);
+  }
+
+  // If tests were generated, inject a note into the revision block so the implementer knows they must pass
+  if (task.testFilePath) {
+    revisionBlock = `## Unit Test Suite Generated\nTests are at: \`${task.testFilePath}\`\nRun with: \`npm test -- ${task.testFilePath}\`\nAll tests MUST pass before you mark the cycle ready.\n\n` + revisionBlock;
   }
 
   while (attempt <= config.cycle.maxReviseAttempts) {

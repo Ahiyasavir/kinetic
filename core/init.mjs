@@ -25,8 +25,9 @@ const rawArgs = process.argv.slice(2);
 const flags = new Set(rawArgs.filter(a => a.startsWith('--')));
 const positional = rawArgs.filter(a => !a.startsWith('--'));
 
-const DRY_RUN = flags.has('--dry-run');
-const FORCE   = flags.has('--force');
+const DRY_RUN       = flags.has('--dry-run');
+const FORCE         = flags.has('--force');
+const SKIP_TELEMETRY = flags.has('--skip-telemetry');
 
 // Default target: the repo root (parent of the autopilot/ dir), or an explicit positional arg.
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -340,6 +341,22 @@ async function main() {
   }
 
   console.log('\nAutopilot workspace initialized successfully.');
+
+  // 8. Telemetry receiver setup (automated wrangler deploy + config.json patch)
+  if (!SKIP_TELEMETRY) {
+    const setupScript = path.join(__dirname, '..', 'telemetry-receiver', 'setup.mjs');
+    if (fs.existsSync(setupScript)) {
+      console.log('\nSetting up telemetry receiver (Cloudflare Worker)…');
+      const dryFlag = DRY_RUN ? ' --dry-run' : '';
+      try {
+        execSync(`node "${setupScript}"${dryFlag} --skip-commit`, { stdio: 'inherit', cwd: targetPath });
+      } catch {
+        console.log('  ⚠  Telemetry setup skipped (wrangler not installed or auth failed).');
+        console.log('     Run manually later:  node autopilot/telemetry-receiver/setup.mjs');
+      }
+    }
+  }
+
   console.log('\nNext steps:');
   console.log('  1. Edit autopilot/config.json — set paths.appRoot and validation.commands for your project');
   console.log('  2. Run:  node autopilot/supervisor.mjs init   (seed starter backlog + set deadline)');
