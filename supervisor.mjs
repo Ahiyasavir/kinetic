@@ -9,9 +9,10 @@
 //   node autopilot/supervisor.mjs status   # print a snapshot without touching the loop
 
 import { readFile, writeFile } from 'node:fs/promises';
-import { existsSync, readFileSync, readdirSync, statSync, rmSync, appendFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, rmSync } from 'node:fs';
 import {
-  computeVelocityFactor, effectivePerDay, extractKeywords, bestLessonMatch, loadLessons, saveLessons
+  computeVelocityFactor, effectivePerDay, computeAdaptiveCyclesPerDay,
+  extractKeywords, bestLessonMatch, loadLessons, saveLessons
 } from './lib/learn.mjs';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
@@ -64,9 +65,15 @@ import { getModifiedFilesDiffs, formatDiffsForContext } from './lib/select.mjs';
 import { resolveActiveWorkspace } from './lib/workspace-registry.mjs';
 import { describeWorkspace, assertWithinBoundary } from './lib/workspace.mjs';
 import { compileFilters } from './lib/workspace-profile.mjs';
+// Multi-tenant isolation (U-61): explicit tenant id + per-tenant state/lock/budget namespacing.
+import { getTenantId, tenantResolvedLine } from './lib/tenant.mjs';
 // Proactive Scanner agent (U-57) — analyzes codebase for tech-debt during idle time
-import { runScanner } from './agents/scanner.mjs';
+import { runScanner, dismissSuggestion } from './agents/scanner.mjs';
 import { scanner as scannerConfig, scannerResolvedLine } from './config-loader.mjs';
+// Blocked-queue auto-review (U-71) — Haiku triage of blocked tasks during idle time
+import { runBlockedReview, shouldRunBlockedReview } from './agents/blocked-reviewer.mjs';
+// Pre-implementation planning gate (U-83) — intent anchor + Haiku-validated micro-plan
+import { runPlanner } from './lib/planner.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -141,6 +148,11 @@ const config = await (async () => {
 // which equals the config-derived repoGoal for the default workspace (unchanged) and the workspace id
 // for a named one.
 const PROJECT_ID = WORKSPACE.budgetScope;
+// Tenant identity (U-61): the stable per-tenant id threaded through logs, telemetry, and budget
+// tracking. For the default workspace this equals the repoGoal (e.g. 'rushpoint-kinetic-topo'),
+// keeping single-tenant runs byte-identical to before. Named workspaces get their own id so
+// concurrent processes on different directories never share state, locks, or budget counters.
+const TENANT_ID = getTenantId(config, WORKSPACE);
 // Validation is workspace-scoped: a named workspace brings its own commands (or a safe empty set), so
 // we never run one workspace's toolchain against another's repo. For the default workspace this is the
 // engine's configured validation — identical to config.validation. Engine guardrails (syntax /
@@ -672,6 +684,8 @@ async function runCycle(state) {
   task.visibleValue = sel.visibleValue || '';
   task.safeToContinue = sel.safeToContinue !== false;
   task.downgradedFrom = sel.downgradedFrom || null;
+  // U-83: capture the Selector's locked intent (must/mustNot/successSignal) for the planning gate.
+  if (sel.intent) task.intent = sel.intent;
   task.status = 'in-progress';
   const taskScore = scoreTask(task, config);
   task.score = taskScore.total;
@@ -814,6 +828,8 @@ async function runCycle(state) {
   let attempt = 0;
   let validation = { ok: false, summary: 'not run' };
   let validationElapsedMs = 0; // U-49: last validation duration (ms); recorded in history for cycle-time analysis
+  let testerDurationMs = 0; // U-58: tester phase duration (ms); recorded in history for telemetry analysis
+  let testCount = 0;        // U-58: number of test cases generated; recorded in history for telemetry
   let autoFixResult = { fixed: false, summary: 'not run' };
   // CROSS-CYCLE MEMORY: if this task already failed review/validation in an EARLIER cycle, seed the
   // implementer's first attempt with WHY it failed last time — so it fixes the known issue up front
@@ -837,36 +853,60 @@ async function runCycle(state) {
   let testFilePath = null;
   const testerStartTime = Date.now();
   try {
+    const testerEnabled = config.tester?.enabled !== false;
+    if (!testerEnabled) {
+      log('Tester phase disabled (config.tester.enabled=false) — skipping test generation.');
+    } else {
     const testerVars = {
       TASK_JSON: taskJson,
+      TASK_ID: task.id,
+      TASK_TITLE: task.title,
       TARGET_FILES: JSON.stringify(activeFilePaths.slice(0, 8).map(p => ({ path: p })) || []),
       PROJECT_CONTEXT: `Task goal: ${task.goal}\nTask class: ${taskClass}\nTask acceptance criteria:\n${(task.acceptanceCriteria || []).map((c) => `  - ${c}`).join('\n')}`,
       CYCLE_NUM: String(state.cycle),
-      HANDOFF_PATH: handoffRel('tester.json')
+      HANDOFF_PATH: handoffRel('tester.json'),
+      REPO_ROOT: GIT_ROOT  // runner detection: runTester reads package.json from this path
     };
     log(`Tester starting — generating test suite for ${task.id}…`);
-    tester = await core.runTester(testerVars);
-    const testerDurationMs = Date.now() - testerStartTime;
+    tester = await core.runTester(testerVars, config.tester?.model);
+    testerDurationMs = Date.now() - testerStartTime;
     if (tester && tester.testFilePath) {
       testFilePath = tester.testFilePath;
-      log(`✓ Tester generated ${tester.testCount || 0} test cases: ${testFilePath} (${(testerDurationMs / 1000).toFixed(1)}s)`);
-      // Record tester cost in cycle history for analysis
-      if (state.history) {
-        const latestCycle = state.history[state.history.length - 1];
-        if (latestCycle) {
-          latestCycle.telemetry = latestCycle.telemetry || {};
-          latestCycle.telemetry.testerDurationMs = testerDurationMs;
-          latestCycle.telemetry.testCount = tester.testCount || 0;
-        }
-      }
+      testCount = tester.testCount || 0;
+      log(`✓ Tester generated ${testCount} test cases: ${testFilePath} (${(testerDurationMs / 1000).toFixed(1)}s)`);
     } else {
       log('⚠ Tester produced no test file (non-fatal, proceeding with implementation)');
     }
+    } // end testerEnabled block
   } catch (err) {
-    const testerDurationMs = Date.now() - testerStartTime;
+    testerDurationMs = Date.now() - testerStartTime;
     log(`⚠ Tester failed (non-fatal): ${err.message} (${(testerDurationMs / 1000).toFixed(1)}s)`);
     // Continue with implementation even if test generation fails — don't block the cycle
   }
+
+  // 3) PLANNING GATE (U-83) -----------------------------------------------
+  // Write the locked intent anchor (intent-{taskId}.md) and, for risk>=minRisk tasks, a Haiku-
+  // validated micro-plan (plan-{taskId}.md). Fires BEFORE the implementer so the work is anchored
+  // to the original goal (anti scope-drift). No-op when config.planningGate.enabled is false.
+  let planResult = { intentMd: '', planMd: '', skipped: true };
+  try {
+    // Metered invoker: routes through the same per-role seam (cheap model) and folds tokens into usage.
+    const planInvoker = async (prompt, model) => {
+      const res = await runClaudeSeamPerRole({ prompt, cwd: GIT_ROOT, config, label: 'planner', model });
+      recordUsage(res);
+      return res?.text || '';
+    };
+    planResult = await runPlanner(task, HANDOFF_DIR, config, planInvoker, log);
+  } catch (e) { log(`Planning gate skipped (non-fatal): ${e.message}`); }
+  // Inject the intent anchor (+ validated plan) into the implementer's revision block so it codes
+  // against the locked goal from the first attempt.
+  if (planResult && !planResult.skipped && planResult.intentMd) {
+    revisionBlock = `## 🔒 INTENT ANCHOR (locked goal — satisfy every "must", violate no "mustNot")\n` +
+      `${planResult.intentMd}\n` +
+      (planResult.planMd ? `## ✓ VALIDATED MICRO-PLAN (follow this)\n${planResult.planMd}\n` : '') +
+      revisionBlock;
+  }
+  const INTENT_BLOCK = (planResult && planResult.intentMd) ? planResult.intentMd : '';
 
   // Tracks whether the PREVIOUS iteration's failure was mechanical (failing validation) vs a reviewer
   // judgement — drives the Haiku-first revision triage on the next attempt.
@@ -1035,6 +1075,7 @@ async function runCycle(state) {
       VALIDATION: validation.summary + '\n' + validation.results.map((r) => `${r.name}: ${r.ok ? 'ok' : r.tail}`).join('\n'),
       INTEGRATION_BRANCH: config.git.integrationBranch,
       PRIOR_LESSON_RULES,
+      INTENT_ANCHOR: INTENT_BLOCK, // U-83: the locked intent the reviewer must check FIRST
       HANDOFF_PATH: handoffRel('review.json')
     });
     verdict = review?.verdict || 'reject';
@@ -1268,6 +1309,8 @@ async function runCycle(state) {
     costUsd: _cycleUsage?.costUsd ?? null,
     revisions: attempt,
     validationMs: validationElapsedMs || null, // U-49: tracks validation duration to measure parallelism gain
+    testerMs: testerDurationMs || null,        // U-58: tester phase duration for telemetry analysis
+    testCount: testCount || null,              // U-58: number of test cases generated
   });
   // U-56: accumulate per-model usage in app.stats.modelUsage for cost breakdown by model tier.
   if (route?.tierLabel) {
@@ -1429,6 +1472,34 @@ async function paceForWeeklyBudget(state) {
   // Cadence throttle: keep at most (velocity-adjusted) maxCyclesPerDay by spacing cycle starts evenly.
   let perDay = effectivePerDay(wb.maxCyclesPerDay, velocityFactor);
   if (velocityFactor > 1.0) log(`Velocity ${velocityFactor.toFixed(2)}x over budget — throttling cadence ${Math.max(1, Number(wb.maxCyclesPerDay) || 24)}→${perDay} cycles/day.`);
+
+  // TOKEN-AWARE adaptive cadence (smart maxCyclesPerDay). The velocity factor above paces by CYCLE
+  // COUNT and is blind to per-cycle token burn — which let the loop reach 63% of the weekly TOKEN
+  // quota while still reporting "on budget". When weeklyBudget.adaptiveCadence.enabled, derive the
+  // per-day allowance from the LIVE budget governor (remaining usable tokens), the time left in the
+  // window, and the observed avg tokens/cycle — then take the MORE CONSERVATIVE of the two guards.
+  // Fully opt-in: with no adaptiveCadence block this is a no-op (legacy cycle-count pacing unchanged).
+  const ac = wb.adaptiveCadence;
+  if (ac && ac.enabled) {
+    const gov = governCycle(state, config, PROJECT_ID);
+    const remainingUsableTokens = Number.isFinite(gov.usable) ? Math.max(0, gov.usable - gov.spent) : Infinity;
+    const tillResetMs = new Date(u.windowResetAt).getTime() - Date.now();
+    const daysToReset = tillResetMs / 86400000;
+    const avgTokensPerCycle = u.cycles > 0 ? gov.spent / u.cycles : gov.estimate;
+    const adaptivePerDay = computeAdaptiveCyclesPerDay({
+      remainingUsableTokens, daysToReset, avgTokensPerCycle,
+      floorPerDay: ac.minPerDay ?? 4,
+      ceilPerDay: Math.max(1, Number(wb.maxCyclesPerDay) || 200),
+      safetyFactor: ac.safetyFactor ?? 1.0,
+    });
+    u.adaptivePerDay = adaptivePerDay; // persisted for visibility (status line / telemetry)
+    if (adaptivePerDay < perDay) {
+      log(`Adaptive cadence: token-aware cap ${adaptivePerDay}/day ` +
+        `(${Math.round(remainingUsableTokens / 1000)}k usable tok · ${daysToReset.toFixed(1)}d to reset · ` +
+        `~${Math.round(avgTokensPerCycle / 1000)}k tok/cycle) — tighter than cycle-based ${perDay}/day.`);
+      perDay = adaptivePerDay;
+    }
+  }
   // Per-project token budget (U-33): when THIS project (PROJECT_ID) has exhausted its configured token
   // cap, drop to the minimum cadence so it can't keep burning the shared account — independently of any
   // other project's budget. No-op when no budget is configured (isWithinBudget stays true).
@@ -1461,6 +1532,9 @@ async function paceForWeeklyBudget(state) {
     let waitMs = Math.min(minSpacingMs - (Date.now() - new Date(u.lastCycleAt).getTime()), Math.max(0, tillReset));
     if (waitMs > 0) {
       log(`AIMD pacing: waiting ${Math.round(waitMs / 60000)} min (adaptive=${Math.round((u.adaptiveIntervalMs || ADAPTIVE_INITIAL_MS) / 60000)}min; ≤${perDay} cycles/day; ${u.cycles} done, ~$${u.costUsd.toFixed(2)} this window).`);
+      // Persist the computed pacing fields (incl. adaptivePerDay) BEFORE the long wait, so the status
+      // command — which reads state from disk — shows the live cadence cap during the wait, not stale.
+      await saveState(STATE_PATH, state);
       for (let slept = 0; slept < waitMs; slept += 30000) {
         if (existsSync(STOP_FLAG)) { log('STOP flag during pacing — exiting wait.'); return; }
         await sleep(Math.min(30000, waitMs - slept));
@@ -1566,6 +1640,7 @@ async function cmdRoute() {
 
 async function cmdStatus() {
   log(`${describeWorkspace(WORKSPACE)}`);
+  log(tenantResolvedLine(TENANT_ID, WORKSPACE));
   if (!existsSync(STATE_PATH)) return log(`No state yet for workspace "${WORKSPACE.id}". Run: node autopilot/supervisor.mjs init`);
   const s = await loadState(STATE_PATH);
   log(`status=${s.status} cycle=${s.cycle} phase=${s.goalPhase}`);
@@ -1583,7 +1658,11 @@ async function cmdStatus() {
     const tillReset = u.windowResetAt ? (new Date(u.windowResetAt).getTime() - Date.now()) / 86400000 : null;
     log(`weekly budget: ${u.cycles} cyc · $${(u.costUsd || 0).toFixed(2)} · ${Math.round(((u.inputTokens || 0) + (u.outputTokens || 0)) / 1000)}k tok this window`);
     const vf = Number(u.velocityFactor ?? 1);
-    log(`  velocity: ${vf.toFixed(1)}x (${vf > 1 ? 'Throttled' : 'On Budget'}) · cadence ≤${config.weeklyBudget.maxCyclesPerDay}/day · resets ${u.windowResetAt || config.weeklyBudget.resetAt}${tillReset != null ? ` (in ${tillReset.toFixed(1)}d)` : ''}`);
+    // Show the token-aware adaptive cap when active (else the configured ceiling).
+    const cadenceCap = (config.weeklyBudget.adaptiveCadence?.enabled && Number.isFinite(u.adaptivePerDay))
+      ? `${u.adaptivePerDay}/day (adaptive, ceil ${config.weeklyBudget.maxCyclesPerDay})`
+      : `≤${config.weeklyBudget.maxCyclesPerDay}/day`;
+    log(`  velocity: ${vf.toFixed(1)}x (${vf > 1 ? 'Throttled' : 'On Budget'}) · cadence ${cadenceCap} · resets ${u.windowResetAt || config.weeklyBudget.resetAt}${tillReset != null ? ` (in ${tillReset.toFixed(1)}d)` : ''}`);
   }
   log(`lessons learned: ${loadLessons(LESSONS_PATH, log).length} (autopilot/state/lessons.json)`);
   const running = existsSync(LOCK_PATH) && pidAlive((() => { try { return JSON.parse(readFileSync(LOCK_PATH, 'utf8')).pid; } catch { return 0; } })());
@@ -1672,6 +1751,7 @@ async function cmdRun() {
   if (!existsSync(STATE_PATH)) { log(`No state for workspace "${WORKSPACE.id}". Run init first.`); return; }
   log(queuePathsResolvedLine());
   log(locksResolvedLine());
+  log(tenantResolvedLine(TENANT_ID, WORKSPACE));
   log(gitConfigResolvedLine());
   log(budgetsResolvedLine());
   log(telemetryResolvedLine());
@@ -1703,8 +1783,8 @@ async function cmdRun() {
 
   // Decoupled engine telemetry (U-36): bring up the independent metric/event recorder and emit the
   // startup event. Disabled by default → every recorder is a no-op, so this never alters loop behavior.
-  initTelemetry(telemetryConfig);
-  recordEvent('supervisor-startup', { projectId: PROJECT_ID, cycle: state.cycle, pid: process.pid });
+  initTelemetry({ ...telemetryConfig, projectId: PROJECT_ID });
+  recordEvent('supervisor-startup', { projectId: PROJECT_ID, tenantId: TENANT_ID, cycle: state.cycle, pid: process.pid });
   syncTelemetry(state);
 
   // graceful shutdown — state is already flushed each step, this just records intent
@@ -1789,6 +1869,16 @@ async function cmdRun() {
     // Run idle-time scanner during cooldown (detects tech-debt patterns for background maintenance)
     const noScanFlag = process.argv.includes('--no-scan') || process.env.KINETIC_NO_SCAN === '1';
     await runIdleScanner(state, !noScanFlag);
+    // U-71: Blocked-queue auto-review — every N cycles, Haiku triages blocked tasks
+    if (shouldRunBlockedReview(state, config)) {
+      try {
+        const brResult = await runBlockedReview(state, config, GIT_ROOT, log);
+        if (brResult.unblocked.length > 0) {
+          await saveState(STATE_PATH, state);
+          await writeMirrors(STATE_DIR, state);
+        }
+      } catch (e) { log(`[blocked-reviewer] skipped (non-fatal): ${e.message}`); }
+    }
   }
 
   state.status = 'done';
@@ -1932,6 +2022,11 @@ async function cmdDismissSuggestion() {
     log('Usage: node autopilot/supervisor.mjs dismiss-suggestion <filename>');
     process.exit(1);
   }
+  const hashMatch = filename.match(/([a-f0-9]+)\.md$/);
+  if (!hashMatch) {
+    log(`Invalid suggestion filename (missing content hash): ${filename}`);
+    process.exit(1);
+  }
   const suggestionsDir = path.join(REPO_ROOT, 'autopilot', 'suggestions');
   const suggestionPath = path.join(suggestionsDir, filename);
   if (!existsSync(suggestionPath)) {
@@ -1939,12 +2034,7 @@ async function cmdDismissSuggestion() {
     process.exit(1);
   }
   try {
-    rmSync(suggestionPath);
-    const hashMatch = filename.match(/([a-f0-9]+)\.md$/);
-    if (hashMatch) {
-      const dismissedPath = path.join(suggestionsDir, '.dismissed');
-      appendFileSync(dismissedPath, hashMatch[1] + '\n', 'utf8');
-    }
+    dismissSuggestion(suggestionPath, hashMatch[1]);
     log(`🗑️ Dismissed: ${filename}`);
   } catch (err) {
     log(`Error dismissing suggestion: ${err.message}`);
