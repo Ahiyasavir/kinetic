@@ -32,6 +32,7 @@
     "roleMap": {
       "_comment": "Map each agent role to a provider name from definitions[].name above. Roles not listed fall back to the global config.provider. DEFAULT = all on 'anthropic' (full quality, zero local setup). LOCAL-OFFLOAD: change a role to 'local' to run it FREE on Ollama (see the 'local' definition's recipe). SAFEST roles to offload to a weak local model: 'selector' (structured ranking) and the regression 'auditor'; KEEP 'implementer' and 'architect' on the cloud model — that is where reasoning quality matters most. Per-role dispatch is wired in supervisor.mjs (runClaudeSeamPerRole).",
       "implementer": "anthropic",
+      "tester": "anthropic",
       "reviewer": "anthropic",
       "selector": "anthropic",
       "auditor": "anthropic",
@@ -57,6 +58,7 @@
   },
   "models": {
     "selector": "claude-haiku-4-5",
+    "tester": "claude-sonnet-4-6",
     "reviewer": "claude-sonnet-4-6",
     "auditor": "claude-haiku-4-5",
     "architect": "claude-fable-5",
@@ -153,7 +155,7 @@
   },
   "budgetGovernor": {
     "enabled": true,
-    "weeklyTokenQuota": null,
+    "weeklyTokenQuota": 200000000,
     "reserveFraction": 0.10,
     "safetyMargin": 0.15,
     "retryBuffer": 1.50,
@@ -178,11 +180,17 @@
   },
   "weeklyBudget": {
     "enabled": true,
-    "resetAt": "2026-06-10T22:00:00.000Z",
+    "resetAt": "2026-06-11T21:59:00.000Z",
     "resetIntervalDays": 7,
     "maxCyclesPerDay": 200,
     "velocitySensitivity": 1.0,
-    "_comment": "Weekly usage governor (2026-06-05). Account spendora.tracker@gmail.com is SHARED between the kinetic and the user's own Claude sessions, so we pace by cadence (a min gap between cycle starts = 24h/maxCyclesPerDay) to spread consumption evenly to resetAt and leave headroom for the user. The kinetic self-meters its own tokens/cost (state.usage) for visibility; tune maxCyclesPerDay up/down after watching the real burn. Window auto-rolls every resetIntervalDays."
+    "adaptiveCadence": {
+      "enabled": true,
+      "minPerDay": 4,
+      "safetyFactor": 0.9,
+      "_comment": "SMART maxCyclesPerDay (token-aware). Instead of pacing purely by cycle COUNT (which is blind to per-cycle token burn — exactly how the loop reached 63% of the weekly TOKEN quota while still reporting 'on budget'), this derives the daily cycle allowance every loop from the LIVE budget governor: perDay = floor((remainingUsableTokens / avgTokensPerCycle) × safetyFactor / daysToReset), clamped to [minPerDay, maxCyclesPerDay]. maxCyclesPerDay above now acts as the CEILING (upper bound), not a flat cap. As tokens deplete cadence auto-tightens; after the weekly reset (full quota) it relaxes back toward the ceiling — no manual retuning. minPerDay: the hard floor so the loop never fully stalls. safetyFactor (<1): reserve headroom for the user on the shared account (0.9 = use at most 90% of the affordable rate). The pacer takes the MORE CONSERVATIVE of this and the cycle-count velocity guard. enabled:false reverts to pure cycle-count pacing (fully backward compatible)."
+    },
+    "_comment": "Weekly usage governor (2026-06-05). Account spendora.tracker@gmail.com is SHARED between the kinetic and the user's own Claude sessions, so we pace by cadence (a min gap between cycle starts = 24h/maxCyclesPerDay) to spread consumption evenly to resetAt and leave headroom for the user. The kinetic self-meters its own tokens/cost (state.usage) for visibility. maxCyclesPerDay is now the CEILING for the token-aware adaptiveCadence below (was a flat cap). Window auto-rolls every resetIntervalDays."
   },
   "budgets": {
     "rushpoint-kinetic-topo": { "maxTokensPerCycle": 80000000, "maxSpendPerEvent": 500 },
@@ -207,8 +215,7 @@
   },
   "telemetry": {
     "enabled": true,
-    "endpoint": "https://kinetic-telemetry.SUBDOMAIN.workers.dev/ingest",
-    "_endpoint_comment": "replace SUBDOMAIN after running: cd autopilot/telemetry-receiver && wrangler deploy",
+    "endpoint": "https://kinetic-telemetry.kinetic-savir.workers.dev/ingest",
     "batchSize": 50,
     "flushIntervalMs": 60000,
     "_comment": "Decoupled engine telemetry (U-36), resolved by autopilot/config-loader.mjs → { telemetry } and consumed by autopilot/lib/telemetry.mjs. Reports the AUTOPILOT ENGINE's own health/metrics (cycle duration, token count, error count, an event log) INDEPENDENTLY of the RushPoint product — supervisor.mjs + watchdog.mjs emit events at startup / cycle-start / cycle-end / on-error. State persists in state.json under framework.telemetry (separate from the app tier). `enabled:false` makes every recorder a no-op (disable without touching supervisor logic); set `endpoint` to a monitoring URL to batch events out, else they buffer locally. Omit this whole block to default to disabled (backward compatible)."
@@ -223,7 +230,7 @@
   "_disableDependencyOptimization_comment": "U-45 safety valve. Set to true to revert to full-file loading in the Selector (skips the AST-based dep-graph filter). Useful for debugging or comparing token counts. False (default) = optimization active when a contextProvider is enabled.",
   "enableSelectorDiffMode": true,
   "_enableSelectorDiffMode_comment": "U-52 git diff optimization. Set to true (default) to reduce Selector context token usage by passing git diffs of modified files instead of full file contents. Set to false to revert to full-file context (disables the optimization for debugging/comparison).",
-  "profileSelectorTokens": false,
+  "profileSelectorTokens": true,
   "_profileSelectorTokens_comment": "U-45/U-52 measurement flag. Set to true to log token-reduction metrics (stdout, [dep-opt] and [U-52] prefixes). Enables benchmarking dep-graph filtering + diff-mode savings on a representative run.",
   "contextProvider": {
     "enabled": false,
@@ -245,9 +252,39 @@
     "ignorePaths": ["node_modules", "dist", "build", "coverage", "target", ".next", ".vite"],
     "_comment": "Proactive Scanner agent (U-57) — runs during idle time between cycles to detect tech-debt patterns (unused imports, nested logic, missing error handling, hardcoded paths, magic numbers, dead code). Generates Markdown tickets into autopilot/suggestions/ for user approval. enabled:false disables the scanner. runDuringIdleTime:true activates idle-time execution between cycles. ignorePaths lists directory segments to skip during analysis."
   },
+  "tester": {
+    "enabled": true,
+    "model": "claude-haiku-4-5",
+    "_comment": "U-58 Tester agent — runs after Selector, before Implementer. Generates a node:test suite for the selected task and writes it to the handoff dir. enabled:false disables the phase entirely (supervisor proceeds without a generated test file). model: the LLM to use for test generation (haiku is sufficient for boilerplate test scaffolding). The Implementer receives testerFile in its handoff JSON; enforcement (blocking on test failures) is deferred to a follow-up task."
+  },
+  "blockedReview": {
+    "enabled": true,
+    "intervalCycles": 10,
+    "model": "claude-haiku-4-5",
+    "timeoutMs": 60000,
+    "_comment": "U-71 Blocked-queue auto-review — every intervalCycles cycles, if blocked.length > 0, a short Haiku call reviews each blocked task: given the blockReason + recent git log, should this task be retried? A 'yes' verdict moves the task from blocked to backlog (needsReReview:true); a 'no' leaves it blocked. enabled:false disables entirely. model: the LLM to use (Haiku is sufficient — simple yes/no triage). intervalCycles: run frequency in cycles (default 10)."
+  },
+  "planningGate": {
+    "enabled": true,
+    "minRisk": 3,
+    "model": "claude-haiku-4-5",
+    "_comment": "U-83 planning gate (autopilot/lib/planner.mjs, wired after the Selector / before the Implementer). Deliverable 1: an INTENT ANCHOR (intent-{taskId}.md) is always written from the Selector's locked must/mustNot/successSignal — the Reviewer reads it first and blocks if any 'must' is unmet. Deliverable 2: for tasks with risk >= minRisk a cheap model drafts a micro-plan (plan-{taskId}.md) which a Haiku call validates against the intent (APPROVE/REJECT → one revise → proceed anyway, never blocks). Both are injected into the Implementer's prompt so it codes against the locked goal from attempt 1 (anti scope-drift). enabled:false skips the whole phase (a full cycle still completes). model: the LLM for plan draft+validation (Haiku sufficient). minRisk: risk floor for the micro-plan step (intent anchor is written regardless)."
+  },
   "locks": {
     "watchdog": "{repoGoal}.watchdog.lock",
     "supervisor": "{repoGoal}.supervisor.lock",
     "_comment": "Process-lock filenames (U-32), resolved at engine startup by autopilot/lib/lock-manager.mjs. {repoGoal} expands to the active target repo + goal segment (repo dir name + the git.integrationBranch suffix after '/', e.g. 'rushpoint-kinetic-topo') so two kinetic instances against different targets/goals never share a lock. Optionally set locks.repoGoal to override the derived segment. Omit this whole `locks` block for the legacy hardcoded 'watchdog.lock'/'supervisor.lock' basenames (backward compatible — graceful fallback, no breaking change). Consumed via autopilot/lib/lock-manager.mjs → { lockPaths }."
+  },
+  "_sandbox_comment": "Sandbox execution seam (U-62, autopilot/core/sandbox.mjs). Isolates each implementation cycle's shell/git/file operations within the tenant's worktree boundary. enabled:false (default) → PassthroughExecutor (transparent, behavior-preserving — zero change for existing single-tenant workflows). enabled:true → WorktreeExecutor validates all file paths against 'path' using path.resolve() + prefix check; any path that resolves outside the boundary throws IsolationViolationError with a clear user message. path defaults to the workspace root (GIT_ROOT) when omitted.",
+  "sandbox": {
+    "enabled": false,
+    "path": null
+  },
+  "_contextCompression_comment": "U-81 AST context compression (autopilot/lib/context-compressor.mjs, wired into the Implementer context assembly in supervisor.mjs). When enabled, files in the deterministic relevance hint that exceed minFileSizeLines are parsed with acorn and shrunk to only task-relevant symbols (full bodies) + their 1-hop same-file dep-graph neighbours; every other function/class collapses to a signature. Targets a 40–60% token cut on files >200 lines. level:2 is the default focused mode; level:3 (2-hop) is stubbed and falls back to level:2. SAFE: any parse/infra failure silently returns the full file (Level 0) — a compression bug can NEVER fail a cycle. Per-cycle stats land in state.json → framework.usage.lastCompressionStats. enabled:false (default) ⇒ zero behavior change — enable only after verifying compressed context does not degrade Implementer output on test tasks.",
+  "contextCompression": {
+    "enabled": false,
+    "minFileSizeLines": 200,
+    "level": 2,
+    "_comment": "U-81 context compression — disabled by default; enable after testing with level:2"
   }
 }

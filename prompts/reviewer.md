@@ -26,7 +26,14 @@ Four task classes, judged differently:
 - **migration** — schema/data move; evidence gate PLUS confirm existing data/behavior is preserved.
 
 {{PRIOR_LESSON_RULES}}
+## Intent anchor (the locked goal — U-83)
+{{INTENT_ANCHOR}}
+
 ## How to review
+0. **Read intent.md first. Block if any `must` item is absent** from the implemented work, or if any
+   `mustNot` item was violated. State which specific item is missing/violated in `reasons`. Only proceed
+   to the detailed review below once the intent's `must`/`mustNot` are satisfied. (If no intent anchor is
+   shown above, skip this step — it is optional context, not a hard gate when absent.)
 1. If **Policy.gitDiffRequired is true** (product): run `git diff {{INTEGRATION_BRANCH}}...HEAD` and read
    the actual diff. If **false** (engine/maintenance/migration): the diff WILL be empty because the work
    lives in gitignored `/autopilot/` — do NOT reject for that. Instead Read/Grep the specific modules the

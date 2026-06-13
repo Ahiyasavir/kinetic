@@ -678,28 +678,41 @@ function loadExistingTickets(suggestionsDir) {
 }
 
 /**
- * Dismiss a suggestion ticket by adding its content hash to the .dismissed file.
+ * Internal helper: persist a content hash into the .dismissed log for a suggestions directory.
+ * Deduplicates before writing; tolerates a missing .dismissed file.
  *
  * @param {string} suggestionsDir - path to autopilot/suggestions/
- * @param {string} contentHash - the hash to dismiss
+ * @param {string} contentHash - the hash to persist
  */
-function dismissSuggestion(suggestionsDir, contentHash) {
-  try {
-    const dismissedPath = path.join(suggestionsDir, '.dismissed');
-    let dismissed = [];
-
-    if (existsSync(dismissedPath)) {
-      const content = readFileSync(dismissedPath, 'utf8');
-      dismissed = content.split('\n').filter(h => h.trim().length > 0);
-    }
-
-    if (!dismissed.includes(contentHash)) {
-      dismissed.push(contentHash);
-      writeFileSync(dismissedPath, dismissed.join('\n') + '\n', 'utf8');
-    }
-  } catch (err) {
-    // Ignore write errors for dismissed file
+function _persistDismissedHash(suggestionsDir, contentHash) {
+  const dismissedPath = path.join(suggestionsDir, '.dismissed');
+  let dismissed = [];
+  if (existsSync(dismissedPath)) {
+    const content = readFileSync(dismissedPath, 'utf8');
+    dismissed = content.split('\n').filter(h => h.trim().length > 0);
   }
+  if (!dismissed.includes(contentHash)) {
+    dismissed.push(contentHash);
+    writeFileSync(dismissedPath, dismissed.join('\n') + '\n', 'utf8');
+  }
+}
+
+/**
+ * Unified dismissal pipeline: unlink the suggestion file and atomically persist its content
+ * hash to the .dismissed log so it is never re-generated. This is the single canonical mutation
+ * point for dismissal — no other code should call unlinkSync or appendFileSync on these paths.
+ *
+ * Exported so supervisor.mjs can delegate all dismiss I/O here (Cycle-207 fix).
+ *
+ * @param {string} suggestionPath - absolute path to the suggestion .md file
+ * @param {string} contentHash    - the hash extracted from the filename (8-char hex)
+ */
+export function dismissSuggestion(suggestionPath, contentHash) {
+  const suggestionsDir = path.dirname(suggestionPath);
+  if (existsSync(suggestionPath)) {
+    unlinkSync(suggestionPath);
+  }
+  _persistDismissedHash(suggestionsDir, contentHash);
 }
 
 /**
@@ -898,7 +911,7 @@ export function cmdApproveSuggestion(suggestionsDir, filename, telemetry = null)
 }
 
 /**
- * Dismiss a suggestion ticket, adding it to the dismissed list.
+ * Dismiss a suggestion ticket via the centralized dismissSuggestion pipeline.
  * Emits telemetry event for dismissal tracking.
  *
  * @param {string} suggestionsDir - path to autopilot/suggestions/
@@ -913,7 +926,7 @@ export function cmdDismissSuggestion(suggestionsDir, filename, telemetry = null)
     throw new Error(`Invalid suggestion filename: ${filename}`);
   }
 
-  dismissSuggestion(suggestionsDir, contentHash);
+  dismissSuggestion(path.join(suggestionsDir, filename), contentHash);
 
   // Emit telemetry
   if (telemetry && typeof telemetry.recordEvent === 'function') {
@@ -921,4 +934,4 @@ export function cmdDismissSuggestion(suggestionsDir, filename, telemetry = null)
   }
 }
 
-export default { runScanner, deduplicateIssues, cmdApproveSuggestion, cmdDismissSuggestion };
+export default { runScanner, deduplicateIssues, dismissSuggestion, cmdApproveSuggestion, cmdDismissSuggestion };

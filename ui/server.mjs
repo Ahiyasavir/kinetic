@@ -60,9 +60,31 @@ export async function handleRequest(req, res) {
   const route = url.pathname;
   const ws = url.searchParams.get('ws');
   try {
-    // ── static UI ──
-    if (req.method === 'GET' && (route === '/' || route === '/index.html')) {
-      return sendFile(res, path.join(PUBLIC_DIR, 'index.html'), 'text/html; charset=utf-8');
+    // ── static UI (serves the Vite-built React SPA + its assets) ──
+    if (req.method === 'GET' && !route.startsWith('/api/')) {
+      const MIME = {
+        '.html': 'text/html; charset=utf-8',
+        '.js':   'application/javascript; charset=utf-8',
+        '.css':  'text/css; charset=utf-8',
+        '.svg':  'image/svg+xml',
+        '.ico':  'image/x-icon',
+        '.png':  'image/png',
+        '.woff2': 'font/woff2',
+      };
+      const candidates = [
+        path.join(PUBLIC_DIR, route === '/' ? 'index.html' : route),
+        path.join(PUBLIC_DIR, route, 'index.html'),
+      ];
+      for (const f of candidates) {
+        if (!f.startsWith(PUBLIC_DIR)) continue; // path-traversal guard
+        if (existsSync(f)) {
+          const ext = path.extname(f).toLowerCase();
+          return sendFile(res, f, MIME[ext] || 'application/octet-stream');
+        }
+      }
+      // SPA fallback for client-side routes
+      const idx = path.join(PUBLIC_DIR, 'index.html');
+      if (existsSync(idx)) return sendFile(res, idx, 'text/html; charset=utf-8');
     }
     // ── health ──
     if (req.method === 'GET' && route === '/api/health') {
@@ -85,6 +107,23 @@ export async function handleRequest(req, res) {
     if (req.method === 'GET' && route === '/api/activity') {
       const n = Math.max(1, Math.min(200, Number(url.searchParams.get('n')) || 20));
       return send(res, 200, await api.getActivity(requireWorkspace(ws), n));
+    }
+    if (req.method === 'GET' && route === '/api/stats') {
+      const b = await api.getBudget(requireWorkspace(ws));
+      const remaining = b.quota && isFinite(b.quota) ? Math.max(0, b.quota - b.spent) : null;
+      return send(res, 200, {
+        totalBudget: b.quota,
+        spent: b.spent,
+        remaining,
+        costPerCycle: b.usage.cycles > 0 ? b.usage.costUsd / b.usage.cycles : 0,
+        inputTokens: b.usage.inputTokens,
+        outputTokens: b.usage.outputTokens,
+      });
+    }
+    if (req.method === 'GET' && route === '/api/history') {
+      const n = Math.max(1, Math.min(200, Number(url.searchParams.get('n')) || 50));
+      const activity = await api.getActivity(requireWorkspace(ws), n);
+      return send(res, 200, activity.history || []);
     }
     if (req.method === 'GET' && route === '/api/keys') {
       const w = requireWorkspace(ws);
@@ -123,7 +162,7 @@ export function createControlServer() {
 }
 
 /** Start the server bound to 127.0.0.1 (loopback only). Returns { server, url }. */
-export function startControlServer({ port = 4317, host = '127.0.0.1' } = {}) {
+export function startControlServer({ port = 3000, host = '127.0.0.1' } = {}) {
   const server = createControlServer();
   return new Promise((resolve) => {
     server.listen(port, host, () => {
@@ -135,7 +174,7 @@ export function startControlServer({ port = 4317, host = '127.0.0.1' } = {}) {
 
 // CLI entry: `node autopilot/ui/server.mjs [port]`
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const port = Number(process.argv[2]) || 4317;
+  const port = Number(process.argv[2]) || 3000;
   startControlServer({ port }).then(({ url }) => {
     console.log(`[kinetic] control center → ${url}  (loopback only; Ctrl+C to stop)`);
   });

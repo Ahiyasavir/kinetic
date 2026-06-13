@@ -119,6 +119,11 @@ Use the Write tool to create `{{HANDOFF_PATH}}` containing EXACTLY this JSON (no
     "safeToContinue": true,
     "acceptanceCriteria": ["specific, checkable, user/admin-visible outcomes"],
     "implementationHints": ["files/dirs to touch, constraints to respect"],
+    "intent": {
+      "must": ["what MUST exist or work when done — max 5 bullets"],
+      "mustNot": ["files/modules NOT to touch — max 3 bullets"],
+      "successSignal": "one sentence: how a human verifies this task is done in 30 seconds"
+    },
     "downgradedFrom": null
   },
   "newBacklog": [

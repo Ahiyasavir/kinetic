@@ -10,7 +10,12 @@ export const HANDOFF_FILE = 'implementation.json';
 
 /**
  * @param {{invokeRole:Function, readHandoff:Function}} runner
- * @param {object} vars    prompt template variables (TASK_JSON, REVISION_BLOCK, HANDOFF_PATH …)
+ * @param {object} vars    prompt template variables. Beyond the task spec (TASK_JSON, REVISION_BLOCK,
+ *                         HANDOFF_PATH …) the strict-TDD Green phase supplies:
+ *                           • TEST_FILE_CONTENT   — exact content of the failing test to satisfy
+ *                           • TEST_EXECUTION_ERROR — pre-rendered stack-trace block from the last test
+ *                             run on a revision (empty on the first attempt / when the last run passed).
+ *                         Both are plain strings forwarded verbatim into the prompt — no logic here.
  * @param {string} [model] model chosen by the host's risk/category routing
  * @returns parsed implementation handoff (or null)
  */

@@ -7,6 +7,10 @@
 //   node autopilot/supervisor.mjs init     # seed state/ + starter backlog, set the 5-day deadline
 //   node autopilot/supervisor.mjs run      # start / resume the autonomous loop (same command)
 //   node autopilot/supervisor.mjs status   # print a snapshot without touching the loop
+//
+// Multi-tenant flags (U-61):
+//   --workspace <id>   select named workspace (overrides KINETIC_WORKSPACE env var)
+//                      state/lock/budget for that workspace are fully isolated
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync, readFileSync, readdirSync, statSync, rmSync } from 'node:fs';
@@ -14,7 +18,7 @@ import {
   computeVelocityFactor, effectivePerDay, computeAdaptiveCyclesPerDay,
   extractKeywords, bestLessonMatch, loadLessons, saveLessons
 } from './lib/learn.mjs';
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -35,7 +39,8 @@ import { ingestInbox, addInboxTask, ensureInbox } from './lib/inbox.mjs';
 import { snapshotProtected, frozenProtectedFiles } from './lib/protect.mjs';
 import { createCore } from './core/index.mjs';
 import { runPostMortem } from './core/post-mortem.mjs';
-import { queuePathsResolvedLine, budgetsResolvedLine, telemetry as telemetryConfig, telemetryResolvedLine, apiPools, keyRotation, keyRotationActive, apiPoolsResolvedLine } from './config-loader.mjs';
+import { createSandbox } from './core/sandbox.mjs';
+import { queuePathsResolvedLine, budgetsResolvedLine, telemetry as telemetryConfig, telemetryResolvedLine, apiPools, keyRotation, keyRotationActive, apiPoolsResolvedLine, sandbox as sandboxConfig, sandboxResolvedLine } from './config-loader.mjs';
 import { createKeyManager, makeRotatingRun } from './lib/key-manager.mjs';
 import { initTelemetry, recordEvent, flushTelemetry, getTelemetryState } from './lib/telemetry.mjs';
 import { locksResolvedLine } from './lib/lock-manager.mjs';
@@ -55,6 +60,7 @@ import { resolveModelForRole, getProviderForRole } from './core/providers.mjs';
 import { nonLlmAudit } from './lib/verify.mjs';
 // Intelligence Efficiency Layer (P1–P3) — deterministic helpers layered on top of the existing systems.
 import { compileContext, contextHintBlock } from './lib/context-compiler.mjs';
+import { compressContext, compressedContextBlock } from './lib/context-compressor.mjs';
 import { loadRuleLessons, filterForImplementer, filterForReviewer, formatLessonsBlock, filterFailureLessonsByFiles, formatFailureLessonsBlock } from './lib/lessons-injector.mjs';
 import { buildDependencyGraph } from './core/dependencies.mjs';
 import { selectorFingerprint, getCachedDecision, putCachedDecision, cacheHitRate } from './lib/fingerprint-cache.mjs';
@@ -74,6 +80,9 @@ import { scanner as scannerConfig, scannerResolvedLine } from './config-loader.m
 import { runBlockedReview, shouldRunBlockedReview } from './agents/blocked-reviewer.mjs';
 // Pre-implementation planning gate (U-83) — intent anchor + Haiku-validated micro-plan
 import { runPlanner } from './lib/planner.mjs';
+// Active stack-trace feedback (Green phase): reuse the Tester's runner detection so the supervisor can
+// physically execute the generated test file with the project's real runner during a revision.
+import { detectTestRunner } from './core/tester/index.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -106,10 +115,12 @@ const ADAPTIVE_MAX_MS     = 60 * 60 * 1000; // 60 min ceiling
 // validation) now flows from ONE Workspace object instead of five separate config singletons. The
 // DEFAULT workspace is constructed to EQUAL the engine's existing resolved values (gitConfig.cwd,
 // queuePaths.*, lockPaths.*, repoGoal, the configured validation), so the default run is byte-identical
-// — only an explicitly-selected named workspace (KINETIC_WORKSPACE / workspaces.json) gets isolated
+// — only an explicitly-selected named workspace (KINETIC_WORKSPACE / --workspace / workspaces.json) gets isolated
 // dirs. The watchdog's KINETIC_GIT_ROOT still overrides the default workspace's operating root.
+const wsFlag = process.argv.indexOf('--workspace');
+const wsArg = wsFlag !== -1 ? process.argv[wsFlag + 1] : null;
 const { workspace: WORKSPACE, registry: WORKSPACE_REGISTRY } = resolveActiveWorkspace({
-  envId: process.env.KINETIC_WORKSPACE, gitRootOverride: process.env.KINETIC_GIT_ROOT,
+  envId: wsArg || process.env.KINETIC_WORKSPACE, gitRootOverride: process.env.KINETIC_GIT_ROOT,
 });
 const GIT_ROOT = WORKSPACE.root;                                  // working dir for git/validation ops
 const STATE_DIR = WORKSPACE.stateDir;                             // isolated per workspace
@@ -158,6 +169,13 @@ const TENANT_ID = getTenantId(config, WORKSPACE);
 // engine's configured validation — identical to config.validation. Engine guardrails (syntax /
 // protected-core in validate.mjs) run regardless of this set.
 const wsConfig = { ...config, validation: WORKSPACE.validation };
+
+// Sandbox execution seam (U-62): isolates tenant shell/git/file operations within the worktree
+// boundary. When sandbox.enabled is false (default), creates a transparent PassthroughExecutor that
+// preserves all existing single-tenant behavior. When enabled, creates a WorktreeExecutor that
+// validates every path against GIT_ROOT and rejects out-of-boundary access with a clear error.
+// The SANDBOX instance is the single seam through which all tenant-facing shell/file ops are routed.
+const SANDBOX = createSandbox(sandboxConfig, GIT_ROOT);
 
 // Plugin scoring (U-44): load the optional scoring plugin declared in config.scoring.plugin.
 // No-op when the key is absent; non-fatal on missing file so the engine doesn't stall on startup.
@@ -462,6 +480,20 @@ function shouldRunAuditor(task, cls, config) {
   return false;                                               // low-risk engine/maintenance → skip the audit
 }
 
+// Build the shell command that runs ONE specific test file with the target repo's detected runner
+// (Active Stack-Trace Feedback, Green phase). Mirrors detectTestRunner's mapping: vitest/jest/mocha/node.
+// The path is quoted so spaces in the cycle dir can't split the argument.
+function buildTestRunCommand(testFilePath, repoRoot) {
+  const { runner } = detectTestRunner(repoRoot);
+  const f = JSON.stringify(testFilePath); // quote for the shell
+  switch (runner) {
+    case 'vitest': return `npx vitest run ${f}`;
+    case 'jest':   return `npx jest ${f}`;
+    case 'mocha':  return `npx mocha ${f}`;
+    default:       return `node --test ${f}`; // native node:test
+  }
+}
+
 // ---------- a single improvement cycle ----------
 async function runCycle(state) {
   state.cycle += 1;
@@ -748,10 +780,11 @@ async function runCycle(state) {
   task.implementerReason = route.reason;
   log(`[MODEL: ${route.tierLabel || route.tier}] Implementer model → ${(route.tierLabel || route.tier).toUpperCase()} (${route.model}) — ${route.reason}`);
 
-  // 2) SNAPSHOT + IMPLEMENT/REVIEW loop -----------------------------------
+  // 1b) SNAPSHOT the integration branch (before the TDD stages below) --------------------------------
   // Work happens directly on the integration branch; we snapshot HEAD and, on any non-approval,
   // reset --hard back to it. No cycle branches (those raced with the implementer's own git in a
-  // shared worktree and let unreviewed commits leak onto main).
+  // shared worktree and let unreviewed commits leak onto main). The strict TDD pipeline
+  // (Planning → Red → Green) runs on top of this snapshot.
   await git.ensureOnIntegration(GIT_ROOT, config.git.integrationBranch);
   const baseSha = await git.revParse(GIT_ROOT, 'HEAD');
   task.baseSha = baseSha;
@@ -795,6 +828,42 @@ async function runCycle(state) {
     }
   } catch (e) { log('context compiler skipped:', e.message); }
 
+  // U-81 — AST context compression. When enabled (default OFF), the relevant files named above are
+  // read and shrunk to only the task-relevant symbols (signatures + relevant bodies) before their
+  // CONTENT is injected into the Implementer prompt — a 40–60% token cut on large files. Defensive by
+  // design: ANY failure silently falls back to the un-compressed prompt (no content block appended),
+  // so a compression bug can never fail a cycle. Disabled by default ⇒ zero behavior change.
+  const ccCfg = config.contextCompression || {};
+  if (ccCfg.enabled && activeFilePaths.length) {
+    try {
+      const taskDesc = `${task.title || ''} ${(task.acceptanceCriteria || []).join(' ')} ${task.notes || ''} ${(task.implementationHints || []).join(' ')}`;
+      const fileObjs = [];
+      for (const rel of activeFilePaths.slice(0, 8)) {
+        try {
+          const abs = path.join(GIT_ROOT, rel);
+          if (existsSync(abs)) fileObjs.push({ path: rel, content: readFileSync(abs, 'utf8') });
+        } catch { /* skip unreadable file */ }
+      }
+      const compressed = compressContext(fileObjs, taskDesc, ccCfg);
+      const block = compressedContextBlock(compressed);
+      if (block) {
+        contextHint += '\n' + block;
+        const origChars = fileObjs.reduce((s, f) => s + f.content.length, 0);
+        const compChars = compressed.files.reduce((s, f) => s + (f.content || '').length, 0);
+        const filesCompressed = compressed.files.filter((f) => f.wasCompressed).length;
+        // Token estimate = chars/4 (rough, sufficient for analytics; feeds U-65/U-66).
+        ensureUsage(state).lastCompressionStats = {
+          filesCompressed,
+          originalTokensEstimate: Math.round(origChars / 4),
+          compressedTokensEstimate: Math.round(compChars / 4),
+          totalRatio: Number(compressed.totalRatio.toFixed(4)),
+        };
+        log(`Context compression: ${filesCompressed} file(s) compressed, ratio ${compressed.totalRatio.toFixed(2)} ` +
+          `(~${Math.round(origChars / 4)}→${Math.round(compChars / 4)} tokens)`);
+      }
+    } catch (e) { log('context compression skipped:', e.message); }
+  }
+
   // U-48: Load rule lessons once per cycle and pre-compute the two filtered blocks.
   // Store the filtered arrays so we can log matched IDs and build the blocks separately.
   const ruleLessons = loadRuleLessons(LESSONS_RULES_PATH, log);
@@ -830,6 +899,7 @@ async function runCycle(state) {
   let validationElapsedMs = 0; // U-49: last validation duration (ms); recorded in history for cycle-time analysis
   let testerDurationMs = 0; // U-58: tester phase duration (ms); recorded in history for telemetry analysis
   let testCount = 0;        // U-58: number of test cases generated; recorded in history for telemetry
+  let testExecutionError = ''; // Active Stack-Trace Feedback: last revision's real test-runner failure output (≤2000 chars)
   let autoFixResult = { fixed: false, summary: 'not run' };
   // CROSS-CYCLE MEMORY: if this task already failed review/validation in an EARLIER cycle, seed the
   // implementer's first attempt with WHY it failed last time — so it fixes the known issue up front
@@ -846,48 +916,19 @@ async function runCycle(state) {
     log(`↺ Seeding implementer with prior-cycle failure memory (cycle ${f.cycle}).`);
   }
 
-  // 2) TEST GENERATION PHASE (U-58) ----------------------------------------
-  // Before implementation, generate comprehensive Jest tests from the task specification.
-  // These tests establish a quality gate at spec-time and the implementer must pass them.
-  let tester = null;
-  let testFilePath = null;
-  const testerStartTime = Date.now();
-  try {
-    const testerEnabled = config.tester?.enabled !== false;
-    if (!testerEnabled) {
-      log('Tester phase disabled (config.tester.enabled=false) — skipping test generation.');
-    } else {
-    const testerVars = {
-      TASK_JSON: taskJson,
-      TASK_ID: task.id,
-      TASK_TITLE: task.title,
-      TARGET_FILES: JSON.stringify(activeFilePaths.slice(0, 8).map(p => ({ path: p })) || []),
-      PROJECT_CONTEXT: `Task goal: ${task.goal}\nTask class: ${taskClass}\nTask acceptance criteria:\n${(task.acceptanceCriteria || []).map((c) => `  - ${c}`).join('\n')}`,
-      CYCLE_NUM: String(state.cycle),
-      HANDOFF_PATH: handoffRel('tester.json'),
-      REPO_ROOT: GIT_ROOT  // runner detection: runTester reads package.json from this path
-    };
-    log(`Tester starting — generating test suite for ${task.id}…`);
-    tester = await core.runTester(testerVars, config.tester?.model);
-    testerDurationMs = Date.now() - testerStartTime;
-    if (tester && tester.testFilePath) {
-      testFilePath = tester.testFilePath;
-      testCount = tester.testCount || 0;
-      log(`✓ Tester generated ${testCount} test cases: ${testFilePath} (${(testerDurationMs / 1000).toFixed(1)}s)`);
-    } else {
-      log('⚠ Tester produced no test file (non-fatal, proceeding with implementation)');
-    }
-    } // end testerEnabled block
-  } catch (err) {
-    testerDurationMs = Date.now() - testerStartTime;
-    log(`⚠ Tester failed (non-fatal): ${err.message} (${(testerDurationMs / 1000).toFixed(1)}s)`);
-    // Continue with implementation even if test generation fails — don't block the cycle
-  }
+  // STRICT TDD PIPELINE — the cycle runs a rigid Planning → Red → Green sequence:
+  //   2) PLANNING  — lock the intent/micro-plan (the contract)
+  //   3) RED       — the Tester writes ONLY a failing test that encodes that contract, persisted to disk
+  //   4) GREEN     — the Implementer reads the failing test's exact content and writes the minimum code
+  //                  needed to make it pass (the implement/review loop below)
+  // Each stage feeds the next: the plan is injected into the Tester; the test's on-disk content is
+  // injected into the Implementer. Backward compatible — when the planning/tester phases are disabled or
+  // produce nothing, the downstream context blocks are simply empty and the loop behaves as before.
 
-  // 3) PLANNING GATE (U-83) -----------------------------------------------
+  // 2) PLANNING GATE (U-83) — RUNS FIRST so the Tester's spec is anchored to a locked intent ----------
   // Write the locked intent anchor (intent-{taskId}.md) and, for risk>=minRisk tasks, a Haiku-
-  // validated micro-plan (plan-{taskId}.md). Fires BEFORE the implementer so the work is anchored
-  // to the original goal (anti scope-drift). No-op when config.planningGate.enabled is false.
+  // validated micro-plan (plan-{taskId}.md). In the strict-TDD order it fires BEFORE the Tester so the
+  // failing test encodes the planned contract. No-op when config.planningGate.enabled is false.
   let planResult = { intentMd: '', planMd: '', skipped: true };
   try {
     // Metered invoker: routes through the same per-role seam (cheap model) and folds tokens into usage.
@@ -907,6 +948,61 @@ async function runCycle(state) {
       revisionBlock;
   }
   const INTENT_BLOCK = (planResult && planResult.intentMd) ? planResult.intentMd : '';
+  // The locked contract the Tester consumes to write its failing spec (TDD Red phase). Empty when the
+  // planning gate was skipped — the Tester then falls back to the task's acceptance criteria alone.
+  const PLAN_BLOCK = (planResult && !planResult.skipped)
+    ? (INTENT_BLOCK + (planResult.planMd ? `\n\n## Validated micro-plan\n${planResult.planMd}` : '')).trim()
+    : '';
+
+  // 3) RED PHASE — TEST GENERATION (U-58 + strict TDD) ---------------------
+  // The Tester consumes the locked intent/micro-plan and writes ONLY a failing test that encodes the
+  // contract (no implementation code). The test file is persisted to disk BEFORE the Implementer runs;
+  // its exact CONTENT is then read back and injected into the Implementer so the Green phase has the
+  // precise spec to satisfy.
+  let tester = null;
+  let testFilePath = null;
+  let testFileContent = ''; // exact on-disk content of the generated failing test (Green-phase context bridge)
+  const testerStartTime = Date.now();
+  try {
+    const testerEnabled = config.tester?.enabled !== false;
+    if (!testerEnabled) {
+      log('Tester phase disabled (config.tester.enabled=false) — skipping test generation (no Red phase).');
+    } else {
+    const testerVars = {
+      TASK_JSON: taskJson,
+      TASK_ID: task.id,
+      TASK_TITLE: task.title,
+      TARGET_FILES: JSON.stringify(activeFilePaths.slice(0, 8).map(p => ({ path: p })) || []),
+      PROJECT_CONTEXT: `Task goal: ${task.goal}\nTask class: ${taskClass}\nTask acceptance criteria:\n${(task.acceptanceCriteria || []).map((c) => `  - ${c}`).join('\n')}`,
+      // TDD: the locked intent/micro-plan the failing test must encode (empty if planning was skipped).
+      PLAN_CONTEXT: PLAN_BLOCK,
+      CYCLE_NUM: String(state.cycle),
+      HANDOFF_PATH: handoffRel('tester.json'),
+      REPO_ROOT: GIT_ROOT  // runner detection: runTester reads package.json from this path
+    };
+    log(`RED phase — Tester writing a failing test for ${task.id}…`);
+    tester = await core.runTester(testerVars, config.tester?.model);
+    testerDurationMs = Date.now() - testerStartTime;
+    if (tester && tester.testFilePath) {
+      testFilePath = tester.testFilePath;
+      testCount = tester.testCount || 0;
+      // Read the EXACT on-disk content — this is the bridge into the Implementer's Green-phase context.
+      // Fall back to the handoff's testContent if the file isn't readable; never fail the cycle on this.
+      try {
+        testFileContent = readFileSync(path.join(GIT_ROOT, testFilePath), 'utf8');
+      } catch {
+        testFileContent = typeof tester.testContent === 'string' ? tester.testContent : '';
+      }
+      log(`✓ RED phase: ${testCount} failing test case(s) written → ${testFilePath} (${(testerDurationMs / 1000).toFixed(1)}s)`);
+    } else {
+      log('⚠ Tester produced no test file (non-fatal, proceeding with implementation)');
+    }
+    } // end testerEnabled block
+  } catch (err) {
+    testerDurationMs = Date.now() - testerStartTime;
+    log(`⚠ Tester failed (non-fatal): ${err.message} (${(testerDurationMs / 1000).toFixed(1)}s)`);
+    // Continue with implementation even if test generation fails — don't block the cycle
+  }
 
   // Tracks whether the PREVIOUS iteration's failure was mechanical (failing validation) vs a reviewer
   // judgement — drives the Haiku-first revision triage on the next attempt.
@@ -920,6 +1016,16 @@ async function runCycle(state) {
       const triage = pickRevisionModel(task, config, { attempt, mechanical: lastFailureMechanical, budgetAction: state.budget?.action });
       if (triage) { attemptModel = triage.model; log(`↳ ${triage.reason}`); }
     }
+    // ACTIVE STACK-TRACE FEEDBACK: when a prior attempt left a captured test-runner failure, render it as
+    // a directed fix instruction (the exact stack trace) for this attempt. Empty on attempt 0 / when the
+    // last run passed — built supervisor-side so the template stays conditional with our dumb {{VAR}}
+    // engine (same pattern as REVISION_BLOCK / CONTEXT_HINT).
+    const TEST_EXECUTION_ERROR = testExecutionError
+      ? `## 🔴 PRIOR TEST FAILURE — FIX THIS EXACT ERROR\n` +
+        `Your previous attempt failed the test. Here is the exact stack trace and error output from the test runner:\n\n` +
+        '```\n' + testExecutionError + '\n```\n\n' +
+        `Analyze this stack trace carefully and fix your implementation so this specific error is resolved.`
+      : '';
     // IMPLEMENT (model chosen by risk/category routing above, or Haiku-triaged for a mechanical retry)
     log(`Implementer starting (attempt ${attempt + 1})…`);
     impl = await core.runImplementer({
@@ -931,6 +1037,10 @@ async function runCycle(state) {
       PROFILE_RULES: WORKSPACE.profile.promptProfile || '',
       APPLICABLE_LESSONS,
       TEST_FILE_PATH: testFilePath || '',
+      // GREEN phase: the exact failing test the implementer must make pass (read from disk above).
+      TEST_FILE_CONTENT: testFileContent || '',
+      // GREEN phase revision: the real stack trace from the last test execution (empty on first attempt).
+      TEST_EXECUTION_ERROR,
       HANDOFF_PATH: handoffRel('implementation.json')
     }, attemptModel);
 
@@ -988,7 +1098,7 @@ async function runCycle(state) {
     // or any subsequent Implementer invocation (the await below enforces this invariant).
     const validationStartTs = Date.now();
     log('Validation started (background)…');
-    const validationPromise = runValidation(wsConfig, GIT_ROOT, lintBaseline, { cacheFile: VALIDATION_CACHE_PATH });
+    const validationPromise = runValidation(wsConfig, GIT_ROOT, lintBaseline, { cacheFile: VALIDATION_CACHE_PATH, sandbox: SANDBOX });
 
     // Pre-draft next-task selector in parallel with validation (attempt 0 only — on revision retries
     // the current task is re-attempted, not advanced, so pre-drafting the NEXT task would be stale).
@@ -1051,6 +1161,33 @@ async function runCycle(state) {
     validation = await validationPromise;
     validationElapsedMs = Date.now() - validationStartTs;
     log(`Validation (${(validationElapsedMs / 1000).toFixed(1)}s): ${validation.summary}`);
+
+    // ACTIVE STACK-TRACE FEEDBACK LOOP (Green phase, TDD) — deterministically execute the generated test
+    // file with the project's real runner. This is the AUTHORITATIVE Red/Green check (not the
+    // implementer's self-report). Runs AFTER the validation await so it augments the RESOLVED validation
+    // object (an earlier push would be clobbered by the reassignment above). On failure we:
+    //   (a) capture stdout+stderr, truncated to 2000 chars → testExecutionError, injected into the NEXT
+    //       attempt's prompt as the exact stack trace to fix; and
+    //   (b) mark validation failed so the bounded revision loop re-runs the implementer.
+    // Best-effort: a tooling error here never crashes the cycle (caught + treated as a normal test fail).
+    testExecutionError = '';
+    if (testFilePath && config.tester?.enabled !== false) {
+      const testCmd = buildTestRunCommand(testFilePath, GIT_ROOT);
+      try {
+        execSync(testCmd, { cwd: GIT_ROOT, encoding: 'utf8', stdio: 'pipe', timeout: 180_000, maxBuffer: 8 * 1024 * 1024 });
+        log(`✓ GREEN: \`${testCmd}\` passed.`);
+      } catch (e) {
+        const combined = `${e.stdout || ''}\n${e.stderr || ''}`.trim() || e.message || 'test runner failed (no output)';
+        testExecutionError = combined.slice(0, 2000); // 2000-char safety cap — prevent context-window bloat
+        log(`✗ RED: \`${testCmd}\` failed — captured ${testExecutionError.length} chars of runner output for the next attempt.`);
+        // Authoritative gate: a failing generated test blocks the cycle exactly like a validation failure.
+        if (!validation.results) validation.results = [];
+        validation.results.push({ name: 'tests', ok: false, tail: `Test execution FAILED (\`${testCmd}\`):\n${testExecutionError}` });
+        validation.ok = false;
+        if (!/TEST FAILURE/.test(validation.summary || '')) validation.summary = `${validation.summary || ''} · TEST FAILURE`.trim();
+      }
+    }
+
     // U-46: Explicit reporting of auto-fixed vs AI-resolved errors
     if (autoFixResult && autoFixResult.errorsFixed !== null) {
       const aiRequired = autoFixResult.errorsAfter || 0;
@@ -1656,7 +1793,15 @@ async function cmdStatus() {
   if (config.weeklyBudget?.enabled && s.usage) {
     const u = s.usage;
     const tillReset = u.windowResetAt ? (new Date(u.windowResetAt).getTime() - Date.now()) / 86400000 : null;
-    log(`weekly budget: ${u.cycles} cyc · $${(u.costUsd || 0).toFixed(2)} · ${Math.round(((u.inputTokens || 0) + (u.outputTokens || 0)) / 1000)}k tok this window`);
+    // Report the SAME token figure the budget governor enforces against the weekly quota: input +
+    // output + cache (read + creation). Claude Code's weekly meter counts cache tokens at full value, so
+    // a live-only (input+output) figure understates real consumption by ~90× (cache ≈ 99% of burn) and
+    // made the budget look almost empty while the governor was already at DOWNGRADE. Show the true total
+    // plus the live/cache split so the breakdown is explicit, not hidden.
+    const liveTok = (u.inputTokens || 0) + (u.outputTokens || 0);
+    const cacheTok = (u.cacheReadTokens || 0) + (u.cacheCreationTokens || 0);
+    const totalTok = liveTok + cacheTok;
+    log(`weekly budget: ${u.cycles} cyc · $${(u.costUsd || 0).toFixed(2)} · ${Math.round(totalTok / 1000)}k tok this window (counts toward quota: live ${Math.round(liveTok / 1000)}k + cache ${Math.round(cacheTok / 1000)}k)`);
     const vf = Number(u.velocityFactor ?? 1);
     // Show the token-aware adaptive cap when active (else the configured ceiling).
     const cadenceCap = (config.weeklyBudget.adaptiveCadence?.enabled && Number.isFinite(u.adaptivePerDay))
@@ -1757,6 +1902,7 @@ async function cmdRun() {
   log(telemetryResolvedLine());
   log(apiPoolsResolvedLine());
   log(scannerResolvedLine());
+  log(sandboxResolvedLine());
   if (keyRotationActive()) log(`Key rotation engaged → ${keyManager.snapshot().filter((k) => k.hasToken).length} live key(s); ${keyRotation.maxRetries} rotations/call before backoff.`);
   log(handoffResolvedLine());
   log(handoffSchemaResolvedLine());
@@ -1957,6 +2103,35 @@ async function cmdResetBreaker() {
   log(`Circuit breaker reset (was: ${was}). Resume with: node autopilot/supervisor.mjs start`);
 }
 
+// Operator: re-anchor the weekly usage window to a new Anthropic reset timestamp.
+// Use this after observing the real reset on the Anthropic dashboard.
+// Usage: node autopilot/supervisor.mjs reset-window [YYYY-MM-DDTHH:MM:SSZ]
+//   With no argument: anchors to "now" (treats current moment as the window start).
+//   With a UTC ISO timestamp: uses that as the start of the current window.
+//   Example: node autopilot/supervisor.mjs reset-window 2026-06-18T21:59:00.000Z
+async function cmdResetWindow() {
+  const state = await loadState(STATE_PATH);
+  const u = state.usage || (state.usage = {});
+  const wb = config.weeklyBudget || {};
+  const intervalMs = (wb.resetIntervalDays || 7) * 86400000;
+
+  const anchor = process.argv[3];
+  const windowStart = anchor ? new Date(anchor).toISOString() : nowIso();
+  const windowReset = new Date(new Date(windowStart).getTime() + intervalMs).toISOString();
+
+  const prev = { windowStartedAt: u.windowStartedAt, windowResetAt: u.windowResetAt };
+  Object.assign(u, {
+    windowStartedAt: windowStart, windowResetAt: windowReset,
+    cycles: 0, calls: 0, inputTokens: 0, outputTokens: 0,
+    cacheReadTokens: 0, cacheCreationTokens: 0, costUsd: 0,
+  });
+  await saveState(STATE_PATH, state);
+  log(`Weekly window re-anchored:`);
+  log(`  was: ${prev.windowStartedAt} → ${prev.windowResetAt}`);
+  log(`  now: ${windowStart} → ${windowReset}`);
+  log(`  Usage counters cleared. Resume with: node autopilot/supervisor.mjs start`);
+}
+
 // List all pending tech-debt suggestions for user review/approval.
 //   node autopilot/supervisor.mjs list-suggestions
 async function cmdListSuggestions() {
@@ -2092,13 +2267,14 @@ try {
   else if (cmd === 'stop') await cmdStop();
   else if (cmd === 'start') await cmdStart();
   else if (cmd === 'reset-breaker') await cmdResetBreaker();
+  else if (cmd === 'reset-window') await cmdResetWindow();
   else if (cmd === 'reconcile') await cmdReconcile();
   else if (cmd === 'verify') await cmdVerify();
   else if (cmd === 'list-suggestions') await cmdListSuggestions();
   else if (cmd === 'approve-suggestion') await cmdApproveSuggestion();
   else if (cmd === 'dismiss-suggestion') await cmdDismissSuggestion();
   else if (cmd === 'run' || cmd === 'resume') await cmdRun();
-  else { log(`Unknown command "${cmd}". Use: start | stop | status | reset-breaker | reconcile [--apply] [--dedupe] | verify | add "task" | run [--no-scan] | list-suggestions | approve-suggestion | dismiss-suggestion | init | route | reprioritize`); process.exit(1); }
+  else { log(`Unknown command "${cmd}". Use: start | stop | status | reset-breaker | reset-window [ISO-ts] | reconcile [--apply] [--dedupe] | verify | add "task" | run [--no-scan] | list-suggestions | approve-suggestion | dismiss-suggestion | init | route | reprioritize`); process.exit(1); }
 } catch (err) {
   const elapsedMs = Date.now() - supervisorStartedAt;
   const activeStep = cmd === 'run' ? 'main-loop' : `cmd-${cmd}`;

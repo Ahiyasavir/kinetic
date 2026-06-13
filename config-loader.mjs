@@ -404,6 +404,28 @@ export function providersResolvedLine() {
   return `config-loaded providers from config.json → [${names}] · roleMap: {${roles}}`;
 }
 
+// Sandbox isolation config (U-62). Resolves the optional `sandbox` block with safe defaults so
+// the execution seam is disabled unless explicitly enabled — omitting the block keeps the engine
+// on the passthrough (transparent) executor, preserving all existing single-tenant behavior.
+// When enabled, the WorktreeExecutor validates every file/shell path against sandbox.path (or the
+// workspace root) and rejects out-of-boundary access with a clear IsolationViolationError.
+const DEFAULT_SANDBOX = { enabled: false, path: null };
+
+const rawSandbox = { ...(config.sandbox || {}) };
+delete rawSandbox._comment; // documentation only — never treat as a sandbox setting
+export const sandbox = {
+  enabled: rawSandbox.enabled ?? DEFAULT_SANDBOX.enabled,
+  path: rawSandbox.path || DEFAULT_SANDBOX.path,
+};
+
+/** One-line startup confirmation that the sandbox config came from config.json (not hardcoded). */
+export function sandboxResolvedLine() {
+  if (!sandbox.enabled) {
+    return 'config-loaded sandbox from config.json → disabled (passthrough mode — single-tenant behavior preserved)';
+  }
+  return `config-loaded sandbox from config.json → enabled · path=${sandbox.path || '(workspace root / fallback)'}`;
+}
+
 // CLI: print the confirmation + the absolute resolution so the wiring is verifiable today.
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   console.log(bundleVariantResolvedLine());
@@ -416,6 +438,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   console.log(providersResolvedLine());
   console.log(validationResolvedLine());
   console.log(autoFixResolvedLine());
+  console.log(sandboxResolvedLine());
   console.log(JSON.stringify({
     repoRoot: paths.repoRoot,
     appRoot: paths.appRoot,
