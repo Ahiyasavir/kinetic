@@ -107,6 +107,42 @@ node autopilot/supervisor.mjs run    # starts the autonomous loop
 Config resolution: `config-loader.mjs` prefers `commercial/config.json` when it exists; it falls
 back to `config.json` at the root. Existing setups using the root file keep working unchanged.
 
+### Step 5 — (optional) enable IDE validation & the engine/project schema
+
+The target config shape separates **project-neutral engine tuning** from a **swappable project
+profile**, documented field-by-field in [`core/config.schema.json`](../core/config.schema.json):
+
+```jsonc
+{
+  "$schema": "core/config.schema.json",      // ← turns on IDE autocomplete + validation
+  "engine":  { "models": { … }, "cli": { … }, "cycle": { … }, "rateLimit": { … } },
+  "project": { "id": "my-project", "workspaceRoot": ".", "git": { … }, "validation": { … },
+               "goals": [ … ], "context": { "provider": "fs", "domainKnowledgeDir": "contexts/my-project" } }
+}
+```
+
+You do **not** have to migrate to this shape immediately. `core/config.mjs` exposes a
+project-agnostic `loadConfig()` that:
+
+- **Accepts today's flat keys** (top-level `models`, `cli`, `validation`, `git`, …) and remaps them
+  into `engine.*` / `project.*`, emitting a one-line deprecation warning — a half-migrated config
+  never crashes the loop.
+- **Falls back to documented defaults** for any missing section instead of throwing.
+- **Validates** the resolved object against `core/config.schema.json` when `ajv` is available, and
+  degrades to a no-op when it is not (so a fresh checkout still boots).
+
+```js
+import { loadConfig } from './autopilot/core/index.mjs';
+const { engine, project, valid, errors } = loadConfig('./autopilot/config.json');
+```
+
+To confirm your config no longer leaks the previous host project into engine code, run the decoupling
+audit (see [`docs/AUDIT.md`](./AUDIT.md)):
+
+```powershell
+node autopilot/scripts/audit-refs.mjs --core-only   # exits 1 if core/ still references a host project
+```
+
 ---
 
 ## 3. Plugin authoring
@@ -350,6 +386,8 @@ not distribution content.
 
 | Doc | Contents |
 |---|---|
+| `autopilot/core/config.schema.json` | Field-by-field schema for the engine/project config shape (IDE validation) |
+| `autopilot/docs/AUDIT.md` | Decoupling audit: hardcoded host-project references + removal effort |
 | `autopilot/docs/ARCHITECTURE.md` | Two-tier state schema (framework vs target tiers) |
 | `autopilot/docs/PROVIDER_CONFIG.md` | Full provider-routing examples (OpenRouter, custom endpoint) |
 | `autopilot/docs/context-provider.md` | Context-provider plugin protocol in depth |

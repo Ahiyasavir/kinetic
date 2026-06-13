@@ -10,6 +10,13 @@ reasoning, and moves on — pausing safely on rate limits and resuming from disk
 > a few shared files. The **integration branch only ever advances through reviewed + validated work**,
 > so existing behavior is preserved by construction.
 
+> **Adopting autopilot on your own project?** Start with the
+> **[Integration Guide → `docs/INTEGRATION.md`](docs/INTEGRATION.md)** — the go-to, zero-to-running
+> walkthrough (config shape, schema/IDE validation, validation hooks, and the swappable project
+> context). The engine/project config split is documented field-by-field in
+> [`core/config.schema.json`](core/config.schema.json); the decoupling audit lives in
+> [`docs/AUDIT.md`](docs/AUDIT.md).
+
 ---
 
 ## 1. How it works (supervisor design)

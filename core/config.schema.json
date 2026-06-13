@@ -1,0 +1,173 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://autopilot.engine/core/config.schema.json",
+  "title": "Autopilot engine config (engine + project)",
+  "description": "Project-agnostic schema for the target two-section config shape: a neutral `engine` block (models, CLI, cadence, routing, budget) and a swappable `project` block (workspace paths, validation commands, goals, git targets, context pointer). The engine reads only `engine.*` plus the ContextProvider derived from `project.*`; it never hard-codes a host project's facts. Point your config.json at this file via `\"$schema\": \"core/config.schema.json\"` for IDE validation and autocomplete. Legacy flat-key configs (top-level `models`, `cli`, `validation`, `git`, ...) are still accepted by core/config.mjs `loadConfig()`, which remaps them into this shape with a deprecation warning.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional pointer to this schema file so editors validate the config."
+    },
+    "engine": {
+      "type": "object",
+      "description": "PROJECT-NEUTRAL engine tuning. Contains nothing about any specific host project.",
+      "properties": {
+        "models": {
+          "type": "object",
+          "description": "Model id per agent role. Values are provider-resolved model ids (or logical tiers).",
+          "properties": {
+            "selector": { "type": "string", "description": "Model for the SELECT role (task ranking)." },
+            "reviewer": { "type": "string", "description": "Model for the REVIEW role (adversarial quality gate)." },
+            "auditor": { "type": "string", "description": "Model for the AUDIT role (regression/scope check)." },
+            "implementerHigh": { "type": "string", "description": "Strong-tier model for high-risk implementation." },
+            "implementerLow": { "type": "string", "description": "Cheaper model for low-risk implementation." }
+          },
+          "additionalProperties": { "type": "string" }
+        },
+        "implementerRouting": {
+          "type": "object",
+          "description": "Risk-aware model routing for the implementer.",
+          "properties": {
+            "opusMinRisk": { "type": "integer", "description": "Risk level at/above which the strong tier is forced." },
+            "opusKeywords": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Title/goal keywords that force the strong tier regardless of risk."
+            }
+          }
+        },
+        "cli": {
+          "type": "object",
+          "description": "Agent CLI invocation settings (provider-neutral).",
+          "properties": {
+            "bin": { "type": "string", "description": "CLI binary name (e.g. \"claude\")." },
+            "outputFormat": { "type": "string", "description": "CLI output format (e.g. \"json\")." },
+            "permission": { "type": "string", "description": "Permission flag passed to the CLI." },
+            "timeoutMs": { "type": "integer", "description": "Per-call timeout in ms." },
+            "maxTurnsPerCall": { "type": "integer", "description": "Max agent turns per CLI call." }
+          }
+        },
+        "cycle": {
+          "type": "object",
+          "description": "Per-cycle cadence and revision limits.",
+          "properties": {
+            "maxReviseAttempts": { "type": "integer", "description": "Max revise loops before a task is blocked." },
+            "cooldownBetweenCyclesMs": { "type": "integer", "description": "Pause between cycles in ms." },
+            "backlogTopUpThreshold": { "type": "integer", "description": "Backlog size below which the selector tops up." }
+          }
+        },
+        "rateLimit": {
+          "type": "object",
+          "description": "Rate-limit cooldown bounds.",
+          "properties": {
+            "baseCooldownMs": { "type": "integer", "description": "Base cooldown after a rate-limit hit." },
+            "maxCooldownMs": { "type": "integer", "description": "Upper bound on backoff cooldown." }
+          }
+        },
+        "weeklyBudget": {
+          "type": "object",
+          "description": "Weekly cadence + velocity governor.",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "resetAt": { "type": "string", "description": "ISO timestamp of the next budget-window reset." },
+            "maxCyclesPerDay": { "type": "integer" },
+            "velocitySensitivity": { "type": "number" }
+          }
+        },
+        "learning": {
+          "type": "object",
+          "description": "Lessons-learned capture + pre-flight match.",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "jaccardThreshold": { "type": "number", "description": "Similarity cutoff for matching past failures." },
+            "revisionFailureThreshold": { "type": "integer" }
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "project": {
+      "type": "object",
+      "description": "SWAPPABLE host-project profile. All project-specific facts live here, never in the engine.",
+      "properties": {
+        "id": { "type": "string", "description": "Stable project id (also used as a context cache key)." },
+        "workspaceRoot": {
+          "type": "string",
+          "description": "Path the agent may edit — the target repo, relative to the autopilot/ parent or absolute."
+        },
+        "git": {
+          "type": "object",
+          "description": "Git targets the engine drives.",
+          "properties": {
+            "integrationBranch": { "type": "string", "description": "Branch all reviewed work lands on." },
+            "baseBranch": { "type": "string", "description": "Branch cycle branches fork from." },
+            "commitPrefix": { "type": "string", "description": "Auto-commit message prefix." }
+          }
+        },
+        "validation": {
+          "type": "object",
+          "description": "Validation hooks — dynamic command arrays run after each implementation.",
+          "properties": {
+            "commands": {
+              "type": "array",
+              "description": "Ordered validation commands. A failing `required` command fails the cycle.",
+              "items": {
+                "type": "object",
+                "required": ["name", "cmd"],
+                "properties": {
+                  "name": { "type": "string", "description": "Short label for the check." },
+                  "cmd": { "type": "string", "description": "Shell command to run." },
+                  "required": { "type": "boolean", "description": "If true, failure blocks the cycle." },
+                  "timeoutMs": { "type": "integer", "description": "Command timeout in ms." }
+                }
+              }
+            },
+            "lintRegressionGuard": { "type": "boolean", "description": "Fail the cycle if the lint-error count increases." },
+            "e2e": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "cmd": { "type": "string" },
+                "timeoutMs": { "type": "integer" }
+              }
+            }
+          }
+        },
+        "goals": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Ordered goal phases the selector cycles through (project-defined)."
+        },
+        "phase": { "type": "string", "description": "Current high-level project phase." },
+        "scoring": {
+          "type": "object",
+          "description": "Task scoring weights and selection thresholds.",
+          "properties": {
+            "weights": { "type": "object", "additionalProperties": { "type": "number" } },
+            "categoryBonus": { "type": "object", "additionalProperties": { "type": "number" } },
+            "minProductShare": { "type": "number" },
+            "minProductTasks": { "type": "integer" },
+            "maxAttemptsBeforeBlock": { "type": "integer" }
+          }
+        },
+        "context": {
+          "type": "object",
+          "description": "Pointer to the ContextProvider that maps this workspace into the agents.",
+          "properties": {
+            "provider": {
+              "type": "string",
+              "description": "Provider kind. \"fs\" reads a contexts/<id>/ directory; future: \"git\", \"remote\"."
+            },
+            "domainKnowledgeDir": {
+              "type": "string",
+              "description": "Directory holding profile.json / seed-backlog.json / domain.md / prompts/ for this project."
+            }
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

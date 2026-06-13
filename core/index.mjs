@@ -52,3 +52,11 @@ export { runAuditor } from './auditor/index.mjs';
 export { runArchitect } from './architect/index.mjs';
 // Re-export shared universal type constants so consumers get them via the core entry-point.
 export { TASK_CLASS, PROVIDER_TYPE } from '../shared/types.mjs';
+// Project-agnostic config loader: normalizes legacy flat keys → engine/project shape + schema validation.
+export {
+  loadConfig,
+  normalizeConfig,
+  validateEngineConfig,
+  DEFAULT_ENGINE_CONFIG,
+  DEFAULT_PROJECT_CONFIG,
+} from './config.mjs';
