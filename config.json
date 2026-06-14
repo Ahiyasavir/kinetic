@@ -145,7 +145,8 @@
   },
   "rateLimit": {
     "baseCooldownMs": 1200000,
-    "maxCooldownMs": 2700000
+    "maxCooldownMs": 2700000,
+    "extendedCooldownMs": 21600000
   },
   "taskClasses": {
     "default": "product",
@@ -173,7 +174,7 @@
   "circuitBreaker": {
     "enabled": true,
     "maxConsecutiveFailures": 5,
-    "maxConsecutiveRateLimits": 8,
+    "maxConsecutiveRateLimits": 15,
     "maxConsecutiveUnproductive": 12,
     "maxWindowCostUsd": null,
     "_comment": "Engine safety halt (SaaS hardening). The supervisor runs unattended against a SHARED paid Claude account, so a runaway state must STOP the loop, not burn the account. Trips (writes the STOP flag → watchdog stays down) when ANY threshold is hit: maxConsecutiveFailures back-to-back crash cycles, maxConsecutiveRateLimits back-to-back rate-limit hits, maxConsecutiveUnproductive back-to-back non-merge cycles (churn), or window spend ≥ maxWindowCostUsd (state.usage.costUsd; null = off). A 'merged' cycle clears the streaks. Set any threshold to 0/null to disable that condition; enabled:false disables the breaker entirely (backward compatible). Resume after fixing the cause: `node autopilot/supervisor.mjs reset-breaker`. Consumed by autopilot/lib/circuit-breaker.mjs + supervisor.mjs."

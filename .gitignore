@@ -11,11 +11,21 @@ install.log
 # Lock files — process-local
 *.lock
 
-# Credentials / API keys
+# Credentials / API keys — NEVER commit
 .account/
+**/.credentials.json
+*.env
+.env
 
 # Node
 node_modules/
+ui/node_modules/
+ui/dist/
+
+# Regenerated artifacts (not source)
+.protected/
+suggestions/
+inbox/processed/
 
 # Compiled / cached outputs
 *.pyc

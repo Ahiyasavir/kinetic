@@ -18,7 +18,7 @@ import {
   computeVelocityFactor, effectivePerDay, computeAdaptiveCyclesPerDay,
   extractKeywords, bestLessonMatch, loadLessons, saveLessons
 } from './lib/learn.mjs';
-import { spawn, execSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -56,6 +56,7 @@ import { checkEvidence } from './lib/evidence.mjs';
 import { analyzeState, applyReconciliation, formatReport } from './lib/reconcile.mjs';
 import { governCycle, detectQuotaMode } from './lib/budget-governor.mjs';
 import { getAdapter } from './lib/providers/index.mjs';
+import { getBestUsage, formatUsageReport } from './lib/usage-provider.mjs';
 import { resolveModelForRole, getProviderForRole } from './core/providers.mjs';
 import { nonLlmAudit } from './lib/verify.mjs';
 // Intelligence Efficiency Layer (P1–P3) — deterministic helpers layered on top of the existing systems.
@@ -126,6 +127,7 @@ const GIT_ROOT = WORKSPACE.root;                                  // working dir
 const STATE_DIR = WORKSPACE.stateDir;                             // isolated per workspace
 const HANDOFF_DIR = WORKSPACE.queuePaths.handoffDir;
 const STATE_PATH = WORKSPACE.statePath;
+const USAGE_SNAPSHOT_PATH = path.join(STATE_DIR, 'usage-snapshot.json');
 const LESSONS_PATH = WORKSPACE.queuePaths.lessonsPath;
 // Rule lessons for prompt injection (U-48): hand-crafted guidelines injected into implementer/reviewer.
 const LESSONS_RULES_PATH = path.join(STATE_DIR, 'lessons-rules.json');
@@ -1098,7 +1100,8 @@ async function runCycle(state) {
     // or any subsequent Implementer invocation (the await below enforces this invariant).
     const validationStartTs = Date.now();
     log('Validation started (background)…');
-    const validationPromise = runValidation(wsConfig, GIT_ROOT, lintBaseline, { cacheFile: VALIDATION_CACHE_PATH, sandbox: SANDBOX });
+    // validation uses exec() directly — sandbox routing for validate.mjs deferred to follow-up hardening
+    const validationPromise = runValidation(wsConfig, GIT_ROOT, lintBaseline, { cacheFile: VALIDATION_CACHE_PATH });
 
     // Pre-draft next-task selector in parallel with validation (attempt 0 only — on revision retries
     // the current task is re-attempted, not advanced, so pre-drafting the NEXT task would be stale).
@@ -1174,7 +1177,13 @@ async function runCycle(state) {
     if (testFilePath && config.tester?.enabled !== false) {
       const testCmd = buildTestRunCommand(testFilePath, GIT_ROOT);
       try {
-        execSync(testCmd, { cwd: GIT_ROOT, encoding: 'utf8', stdio: 'pipe', timeout: 180_000, maxBuffer: 8 * 1024 * 1024 });
+        // Sandbox (U-62): route the test-runner shell call through SANDBOX so it is
+        // constrained to the tenant worktree boundary once enforcement is enabled.
+        const testResult = await SANDBOX.runShell(testCmd, { cwd: GIT_ROOT, timeout: 180_000 });
+        if (testResult.code !== 0) {
+          const execErr = Object.assign(new Error(`test runner exited ${testResult.code}`), testResult);
+          throw execErr;
+        }
         log(`✓ GREEN: \`${testCmd}\` passed.`);
       } catch (e) {
         const combined = `${e.stdout || ''}\n${e.stderr || ''}`.trim() || e.message || 'test runner failed (no output)';
@@ -1551,13 +1560,33 @@ async function pauseForRateLimit(state, err) {
     config.rateLimit.baseCooldownMs * state.rateLimit.consecutiveHits,
     config.rateLimit.maxCooldownMs
   );
-  // Use a parsed real reset time if we got one, else the (gentle) backoff — but ALWAYS cap at
-  // maxCooldownMs so a single bad moment can't lock the loop out for hours. Retrying every ≤45 min is
-  // cheap (a rate-limited call does no work) and catches a rolling-window quota refresh far sooner.
-  const wait = Math.min(
-    err.retryAfterMs && err.retryAfterMs > 0 ? err.retryAfterMs : backoff,
-    config.rateLimit.maxCooldownMs
-  );
+  // Compute the best wait time using a trust hierarchy:
+  //   1. Explicit retryAfterMs from the rate-limit message (most accurate)
+  //   2. Statusline 5h resetAt — if we know when the 5h window resets, wait until then
+  //      (prevents the "45-min retry loop" when the 5h window is fully exhausted)
+  //   3. Backoff capped at maxCooldownMs (original behaviour, safe fallback)
+  let wait;
+  if (err.retryAfterMs && err.retryAfterMs > 0) {
+    wait = Math.min(err.retryAfterMs, config.rateLimit.extendedCooldownMs || 6 * 3600000);
+  } else {
+    // Try to read a real 5h reset time from the statusline snapshot
+    const usageSnap = getBestUsage(state, config, USAGE_SNAPSHOT_PATH);
+    const fiveHourResetAt = usageSnap.fiveHour?.resetAt;
+    const consecutiveHits = state.rateLimit.consecutiveHits;
+    if (fiveHourResetAt && consecutiveHits >= 2) {
+      // We've hit rate limit multiple times in a row — likely 5h window exhaustion.
+      // Wait until the actual 5h reset + 90s buffer so we don't immediately re-hit.
+      const msUntilReset = fiveHourResetAt - Date.now() + 90000;
+      if (msUntilReset > backoff) {
+        wait = Math.min(msUntilReset, config.rateLimit.extendedCooldownMs || 6 * 3600000);
+        log(`  [rate-limit] 5h window reset at ${new Date(fiveHourResetAt).toISOString()} — waiting ${Math.round(wait / 60000)} min instead of ${Math.round(backoff / 60000)} min`);
+      } else {
+        wait = backoff;
+      }
+    } else {
+      wait = backoff;
+    }
+  }
   state.rateLimit.pausedUntil = new Date(Date.now() + wait).toISOString();
   state.status = 'paused-ratelimit';
 
@@ -2103,6 +2132,14 @@ async function cmdResetBreaker() {
   log(`Circuit breaker reset (was: ${was}). Resume with: node autopilot/supervisor.mjs start`);
 }
 
+// Display the current usage state across all trust tiers.
+//   node autopilot/supervisor.mjs usage
+async function cmdUsage() {
+  const state = await loadState(STATE_PATH);
+  const usage = getBestUsage(state, config, USAGE_SNAPSHOT_PATH);
+  log(formatUsageReport(usage));
+}
+
 // Operator: re-anchor the weekly usage window to a new Anthropic reset timestamp.
 // Use this after observing the real reset on the Anthropic dashboard.
 // Usage: node autopilot/supervisor.mjs reset-window [YYYY-MM-DDTHH:MM:SSZ]
@@ -2257,28 +2294,34 @@ async function cmdVerify() {
 }
 
 // ---------- entry ----------
+// Guard: only run the entry dispatch when invoked directly (not when imported by tests).
+// Sandbox (U-62): adding this guard is safe — it preserves CLI behavior and enables imports.
+const isDirectRun = path.resolve(process.argv[1] || '') === fileURLToPath(import.meta.url);
 const cmd = process.argv[2] || 'run';
-try {
-  if (cmd === 'init') await cmdInit();
-  else if (cmd === 'status') await cmdStatus();
-  else if (cmd === 'route') await cmdRoute();
-  else if (cmd === 'reprioritize') await cmdReprioritize();
-  else if (cmd === 'add') await cmdAdd();
-  else if (cmd === 'stop') await cmdStop();
-  else if (cmd === 'start') await cmdStart();
-  else if (cmd === 'reset-breaker') await cmdResetBreaker();
-  else if (cmd === 'reset-window') await cmdResetWindow();
-  else if (cmd === 'reconcile') await cmdReconcile();
-  else if (cmd === 'verify') await cmdVerify();
-  else if (cmd === 'list-suggestions') await cmdListSuggestions();
-  else if (cmd === 'approve-suggestion') await cmdApproveSuggestion();
-  else if (cmd === 'dismiss-suggestion') await cmdDismissSuggestion();
-  else if (cmd === 'run' || cmd === 'resume') await cmdRun();
-  else { log(`Unknown command "${cmd}". Use: start | stop | status | reset-breaker | reset-window [ISO-ts] | reconcile [--apply] [--dedupe] | verify | add "task" | run [--no-scan] | list-suggestions | approve-suggestion | dismiss-suggestion | init | route | reprioritize`); process.exit(1); }
-} catch (err) {
-  const elapsedMs = Date.now() - supervisorStartedAt;
-  const activeStep = cmd === 'run' ? 'main-loop' : `cmd-${cmd}`;
-  const errorOutput = (err && err.code) ? formatEngineError(err, { elapsedMs, activeStep }) : '';
-  log(errorOutput || `Fatal: ${err.stack || err.message}`);
-  process.exit(1);
+if (isDirectRun) {
+  try {
+    if (cmd === 'init') await cmdInit();
+    else if (cmd === 'status') await cmdStatus();
+    else if (cmd === 'route') await cmdRoute();
+    else if (cmd === 'reprioritize') await cmdReprioritize();
+    else if (cmd === 'add') await cmdAdd();
+    else if (cmd === 'stop') await cmdStop();
+    else if (cmd === 'start') await cmdStart();
+    else if (cmd === 'reset-breaker') await cmdResetBreaker();
+    else if (cmd === 'reset-window') await cmdResetWindow();
+    else if (cmd === 'usage') await cmdUsage();
+    else if (cmd === 'reconcile') await cmdReconcile();
+    else if (cmd === 'verify') await cmdVerify();
+    else if (cmd === 'list-suggestions') await cmdListSuggestions();
+    else if (cmd === 'approve-suggestion') await cmdApproveSuggestion();
+    else if (cmd === 'dismiss-suggestion') await cmdDismissSuggestion();
+    else if (cmd === 'run' || cmd === 'resume') await cmdRun();
+    else { log(`Unknown command "${cmd}". Use: start | stop | status | reset-breaker | reset-window [ISO-ts] | reconcile [--apply] [--dedupe] | verify | add "task" | run [--no-scan] | list-suggestions | approve-suggestion | dismiss-suggestion | init | route | reprioritize`); process.exit(1); }
+  } catch (err) {
+    const elapsedMs = Date.now() - supervisorStartedAt;
+    const activeStep = cmd === 'run' ? 'main-loop' : `cmd-${cmd}`;
+    const errorOutput = (err && err.code) ? formatEngineError(err, { elapsedMs, activeStep }) : '';
+    log(errorOutput || `Fatal: ${err.stack || err.message}`);
+    process.exit(1);
+  }
 }
