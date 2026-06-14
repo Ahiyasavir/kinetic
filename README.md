@@ -253,6 +253,37 @@ unless a change is explicitly required, and it must downgrade (not skip) tasks t
 
 ---
 
+## 5b. AST context compression (U-81)
+
+Large source files are mostly noise for a task that touches one function. Before a relevant file's
+**content** is injected into the Implementer prompt, `lib/context-compressor.mjs` parses it with
+**acorn** and shrinks it to only the symbols that matter for the current task — a 40–60% token cut on
+well-structured large files.
+
+- **When it runs.** After the deterministic file-relevance scan (`lib/context-compiler.mjs`) names the
+  relevant files, the supervisor reads each one and, when `config.contextCompression.enabled` is true,
+  passes it through `compressContext(files, taskDescription, cfg)`. Only files over
+  `minFileSizeLines` (default **200**) are touched.
+- **What it keeps.** *Level 2* (default) keeps the **task-relevant symbols at full body** — seeded from
+  identifier-looking words in the task title/criteria/hints — plus their **1-hop same-file dep-graph
+  neighbours** (callers and callees). Every other top-level function/class collapses to a **signature**
+  (`function foo(a, b) { /* … */ }`). *Level 1* keeps no bodies (signatures only). Imports and
+  top-level comments are preserved verbatim.
+- **Safe by construction.** Every path is wrapped so that **any** failure — acorn missing, a TypeScript
+  / dynamic-syntax parse error, an unexpected AST shape, or no net shrink — silently returns the
+  **original full file** (Level 0). The file on disk is never modified; only an in-memory copy is
+  transformed. A compression bug can therefore **never fail a cycle**. Non-JS/TS and TypeScript files
+  fall back to whole-file context (acorn parses JS/`.mjs`; TS syntax errors out → Level 0).
+- **Config** (`config.json → contextCompression`): `enabled` (default **false** ⇒ zero behavior
+  change), `minFileSizeLines` (200), `level` (2; level 3 / 2-hop is stubbed → falls back to 2). Per-cycle
+  stats are recorded in `state.json → framework.usage.lastCompressionStats`
+  (`filesCompressed`, `originalTokensEstimate`, `compressedTokensEstimate`, `totalRatio`).
+- **Benchmark.** `node scripts/benchmark-compression.mjs [dir...]` runs the compressor over real large
+  `.js`/`.mjs` files (defaults to the engine's own `lib/`), simulates a focused task, and reports the
+  per-file and aggregate token reduction plus how many files land in the 40–60% target band. On the
+  engine's well-structured modules it peaks at **60%** (`lib/validate.mjs`); script-style files with few
+  top-level symbols (one big `main`) compress little, which the report makes visible.
+
 ## 5. Safety properties (by design)
 
 - **Integration branch is sacred.** `kinetic/main` only moves forward via a reviewed + validated

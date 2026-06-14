@@ -197,7 +197,31 @@ test('createSandbox WorktreeExecutor uses fallbackRoot when path is not set', as
   });
 });
 
-// ── 6. Tenant malicious config simulation (successSignal) ────────────────────
+// ── 6. Integration: factory return type is callable end-to-end ──────────────
+
+test('createSandbox(null).runShell is callable end-to-end', async () => {
+  const executor = createSandbox(null);
+  assert.ok(typeof executor.runShell === 'function', 'runShell must be a function on the executor');
+  const result = await executor.runShell('echo integration-test', {});
+  assert.equal(result.code, 0, `runShell exited with code ${result.code}: ${result.stderr}`);
+  assert.ok(
+    result.stdout.includes('integration-test'),
+    `stdout should contain "integration-test", got: ${JSON.stringify(result.stdout)}`
+  );
+});
+
+test('createSandbox(null).execShell is callable end-to-end', async () => {
+  const executor = createSandbox(null);
+  assert.ok(typeof executor.execShell === 'function', 'execShell must be a function on the executor');
+  const result = await executor.execShell('echo integration-test', {});
+  assert.equal(result.code, 0, `execShell exited with code ${result.code}: ${result.stderr}`);
+  assert.ok(
+    result.stdout.includes('integration-test'),
+    `stdout should contain "integration-test", got: ${JSON.stringify(result.stdout)}`
+  );
+});
+
+// ── 7. Tenant malicious config simulation (successSignal) ────────────────────
 
 test('WorktreeExecutor blocks simulated malicious tenant reading system files', async () => {
   await withTempDir(async (dir) => {

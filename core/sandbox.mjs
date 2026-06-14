@@ -14,6 +14,20 @@
 //   createSandbox(sandboxConfig, fallbackRoot) → SandboxExecutor
 //     Returns WorktreeExecutor when enabled, PassthroughExecutor otherwise.
 //     Existing single-tenant behavior is fully preserved when sandbox.enabled is false.
+//
+// Canonical public API (both concrete executors expose):
+//   runShell(cmd, opts)          — execute any shell command
+//   runBash(cmd, opts)           — POSIX/bash alias of runShell
+//   runPowerShell(cmd, opts)     — PowerShell wrapper
+//   execGit(cmdOrArgs, opts)     — run git subcommand(s)
+//   readFile(path, enc)          — read a file (WorktreeExecutor validates boundary)
+//   writeFile(path, content)     — write a file (WorktreeExecutor validates boundary)
+//   globFiles(pattern, opts)     — list files matching a pattern
+//   execShell(cmd, opts)         — low-level alias (same as runShell, retained for compatibility)
+//   gitCommand(args, opts)       — low-level alias (same as execGit, retained for compatibility)
+//
+// Resource-limit stubs (defined per executor — enforcement deferred):
+//   timeoutMs, maxMemoryMb, maxDiskMb
 
 import { exec, execFile } from 'node:child_process';
 import { readFile, writeFile, readdir } from 'node:fs/promises';
@@ -96,6 +110,39 @@ export class SandboxExecutor {
   async globFiles(pattern, opts = {}) {
     throw new Error('SandboxExecutor.globFiles is abstract — use WorktreeExecutor or PassthroughExecutor');
   }
+
+  /**
+   * Run a shell command (canonical public name — supervisor.mjs calls this).
+   * Concrete classes delegate to execShell().
+   */
+  async runShell(cmd, opts = {}) {
+    throw new Error('SandboxExecutor.runShell is abstract — use WorktreeExecutor or PassthroughExecutor');
+  }
+
+  /** Run a bash / POSIX shell command (alias of runShell). */
+  async runBash(cmd, opts = {}) {
+    throw new Error('SandboxExecutor.runBash is abstract — use WorktreeExecutor or PassthroughExecutor');
+  }
+
+  /** Run a PowerShell command. */
+  async runPowerShell(cmd, opts = {}) {
+    throw new Error('SandboxExecutor.runPowerShell is abstract — use WorktreeExecutor or PassthroughExecutor');
+  }
+
+  /**
+   * Run a git command (canonical public name — accepts string or string[]).
+   * Concrete classes delegate to gitCommand().
+   * @param {string|string[]} cmdOrArgs
+   */
+  async execGit(cmdOrArgs, opts = {}) {
+    throw new Error('SandboxExecutor.execGit is abstract — use WorktreeExecutor or PassthroughExecutor');
+  }
+
+  // Resource-limit stubs — defined here so instanceof checks can inspect them;
+  // enforcement is a follow-up hardening phase.
+  get timeoutMs()    { return 30_000; }
+  get maxMemoryMb()  { return 512; }
+  get maxDiskMb()    { return 1_024; }
 }
 
 // ── WorktreeExecutor ────────────────────────────────────────────────────────
@@ -169,6 +216,19 @@ export class WorktreeExecutor extends SandboxExecutor {
     return writeFile(resolved, content, encoding);
   }
 
+  async runShell(cmd, opts = {}) { return this.execShell(cmd, opts); }
+  async runBash(cmd, opts = {}) { return this.execShell(cmd, opts); }
+  async runPowerShell(cmd, opts = {}) {
+    const escaped = cmd.replace(/"/g, '\\"');
+    return this.execShell(`powershell.exe -NoProfile -NonInteractive -Command "${escaped}"`, opts);
+  }
+  async execGit(cmdOrArgs, opts = {}) {
+    const args = typeof cmdOrArgs === 'string'
+      ? cmdOrArgs.trim().split(/\s+/).filter(Boolean)
+      : cmdOrArgs;
+    return this.gitCommand(args, opts);
+  }
+
   async globFiles(pattern, opts = {}) {
     const baseDir = opts.cwd ? this._assertPath(opts.cwd) : this.sandboxRoot;
     const allFiles = [];
@@ -231,6 +291,19 @@ export class PassthroughExecutor extends SandboxExecutor {
 
   async writeFile(filePath, content, encoding = 'utf8') {
     return writeFile(filePath, content, encoding);
+  }
+
+  async runShell(cmd, opts = {}) { return this.execShell(cmd, opts); }
+  async runBash(cmd, opts = {}) { return this.execShell(cmd, opts); }
+  async runPowerShell(cmd, opts = {}) {
+    const escaped = cmd.replace(/"/g, '\\"');
+    return this.execShell(`powershell.exe -NoProfile -NonInteractive -Command "${escaped}"`, opts);
+  }
+  async execGit(cmdOrArgs, opts = {}) {
+    const args = typeof cmdOrArgs === 'string'
+      ? cmdOrArgs.trim().split(/\s+/).filter(Boolean)
+      : cmdOrArgs;
+    return this.gitCommand(args, opts);
   }
 
   async globFiles(pattern, opts = {}) {

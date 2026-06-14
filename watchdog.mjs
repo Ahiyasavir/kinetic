@@ -14,7 +14,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, openSync, closeSync, statSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { queuePaths, telemetry as telemetryConfig, telemetryResolvedLine } from './config-loader.mjs';
+import { queuePaths, telemetry as telemetryConfig, telemetryResolvedLine, sandbox as sandboxConfig, sandboxResolvedLine } from './config-loader.mjs';
 import { initTelemetry, recordEvent, flushTelemetry } from './lib/telemetry.mjs';
 import { lockPaths, locksResolvedLine } from './lib/lock-manager.mjs';
 import { gitConfig, gitConfigResolvedLine } from './lib/git-config-loader.mjs';
@@ -97,11 +97,15 @@ function rotateLogIfBig() {
 function syncKineticRepo() {
   if (!existsSync(path.join(__dirname, '.git'))) return;
   try {
+    // Sandbox exemption: these execFileSync calls operate on __dirname (the kinetic engine's
+    // own repository, not any tenant worktree). They are engine infrastructure — syncing the
+    // autopilot source itself to GitHub — and do not execute untrusted tenant code. Sandbox
+    // isolation (U-62) guards tenant worktree access; the engine's self-maintenance is exempt.
     const status = execFileSync('git', ['-C', __dirname, 'status', '--porcelain'], { encoding: 'utf8' }).trim();
     if (!status) return;
-    execFileSync('git', ['-C', __dirname, 'add', '-A'], { encoding: 'utf8' });
-    execFileSync('git', ['-C', __dirname, 'commit', '-m', 'engine: auto-sync'], { encoding: 'utf8' });
-    execFileSync('git', ['-C', __dirname, 'push', 'origin', 'main'], { encoding: 'utf8', timeout: 30000 });
+    execFileSync('git', ['-C', __dirname, 'add', '-A'], { encoding: 'utf8' }); // exempt: engine repo, not tenant
+    execFileSync('git', ['-C', __dirname, 'commit', '-m', 'engine: auto-sync'], { encoding: 'utf8' }); // exempt: engine repo, not tenant
+    execFileSync('git', ['-C', __dirname, 'push', 'origin', 'main'], { encoding: 'utf8', timeout: 30000 }); // exempt: engine repo, not tenant
     log('kinetic repo: changes pushed to GitHub.');
   } catch (e) {
     log('kinetic repo: sync skipped (non-fatal):', e.message?.split('\n')[0] || e.message);
@@ -124,6 +128,9 @@ async function main() {
   log(telemetryResolvedLine());
   log(locksResolvedLine());
   log(gitConfigResolvedLine());
+  // Sandbox isolation config (U-62): watchdog logs the sandbox seam state so startup
+  // confirms whether enforcement is active or passthrough mode is in effect.
+  log(sandboxResolvedLine());
   // U-35: if a dedicated worktree is configured, ensure it exists before the supervisor starts so the
   // engine always has its target checkout ready. No-op for the default in-place RushPoint layout.
   if (gitConfig.worktreeName) {
@@ -186,9 +193,14 @@ async function main() {
   process.exit(0);
 }
 
-main().catch((e) => {
-  const elapsedMs = Date.now() - watchdogStartedAt;
-  const errorOutput = (e && e.code) ? formatEngineError(e, { elapsedMs, activeStep: 'watchdog-startup' }) : '';
-  log(errorOutput || `fatal: ${e.stack || e.message}`);
-  process.exit(1);
-});
+// Guard: only run the watchdog loop when invoked directly (not when imported by tests).
+// Sandbox (U-62): this guard enables safe import() of watchdog.mjs in test environments.
+const isDirectRun = path.resolve(process.argv[1] || '') === fileURLToPath(import.meta.url);
+if (isDirectRun) {
+  main().catch((e) => {
+    const elapsedMs = Date.now() - watchdogStartedAt;
+    const errorOutput = (e && e.code) ? formatEngineError(e, { elapsedMs, activeStep: 'watchdog-startup' }) : '';
+    log(errorOutput || `fatal: ${e.stack || e.message}`);
+    process.exit(1);
+  });
+}
