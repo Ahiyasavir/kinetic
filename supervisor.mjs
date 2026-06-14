@@ -18,7 +18,7 @@ import {
   computeVelocityFactor, effectivePerDay, computeAdaptiveCyclesPerDay,
   extractKeywords, bestLessonMatch, loadLessons, saveLessons
 } from './lib/learn.mjs';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -1864,6 +1864,23 @@ function pidAlive(pid) {
   catch (e) { return e.code === 'EPERM'; }          // EPERM = exists but not ours; ESRCH = gone
 }
 
+// Kill a process AND every descendant. CRITICAL on Windows: process.kill(pid) terminates ONLY the
+// named process, so a supervisor's in-flight `claude -p` subprocess is orphaned and keeps running —
+// burning quota and writing uncoordinated files into the worktree after a `stop`/halt (observed
+// 2026-06-14: a U-62 implementer survived a stop and kept emitting sandbox files for minutes).
+// `taskkill /T` walks the whole tree; on POSIX we signal the process group, then the pid itself.
+function killTree(pid) {
+  if (!pid) return;
+  try {
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
+    } else {
+      try { process.kill(-pid, 'SIGTERM'); } catch { /* not a group leader — fall through */ }
+      try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
+    }
+  } catch { /* best-effort */ }
+}
+
 // Single-instance guard: refuse to start a 2nd supervisor on the same repo (two running = a git race
 // that corrupts cycles — we hit this once, hard). Uses ATOMIC exclusive file creation (flag 'wx'),
 // so even two supervisors started in the same instant cannot both win the lock — exactly one
@@ -2095,7 +2112,7 @@ async function cmdStop() {
     if (existsSync(lock)) {
       try {
         const { pid } = JSON.parse(readFileSync(lock, 'utf8'));
-        if (pid && pidAlive(pid)) { process.kill(pid); log(`stopped ${name} (pid ${pid}).`); }
+        if (pid && pidAlive(pid)) { killTree(pid); log(`stopped ${name} (pid ${pid}) + child processes.`); }
       } catch { /* ignore */ }
     }
   }
