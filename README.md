@@ -231,6 +231,41 @@ On startup the supervisor:
 node autopilot/supervisor.mjs status
 ```
 
+### System self-check (`audit`)
+A deterministic, **token-free** self-check that verifies the framework's on-disk state across five
+categories — `[FILES]` (key paths), `[CONFIG]` (config.json integrity + core sections), `[STATE]`
+(state.json schema + queue counts), `[GIT]` (repo / HEAD / branch / cleanliness) and `[LOCKS]`
+(supervisor/watchdog locks + STOP flag). It never throws on missing/corrupt inputs — a missing file or
+malformed config is reported as a failed check, and a non-zero exit signals at least one failure.
+```powershell
+node autopilot/supervisor.mjs audit            # one-line pass/fail roll-up per category
+node autopilot/supervisor.mjs audit --verbose  # one diagnostic line per individual check
+node autopilot/cli.mjs audit --verbose         # same, via the unified CLI
+```
+Every line is prefixed with its category so output is easy to grep (e.g. `audit --verbose | findstr "[STATE]"`).
+Example `--verbose` output:
+```text
+[FILES] repo root present (directory) ✓
+[FILES] state.json present (file) ✓
+[CONFIG] config.json is valid JSON ✓
+[CONFIG] validation.commands (3) ✓
+[STATE] state.json is valid JSON ✓
+[STATE] schema: two-tier (framework/app) ✓
+[STATE] queue backlog (85) ·
+[STATE] queue done (107) ·
+[STATE] queue blocked (3) !
+[STATE] deadline set (2036-05-30T21:08:26.453Z) ✓
+[GIT] inside a git work tree ✓
+[GIT] HEAD resolved (1947097) ✓
+[GIT] current branch (autopilot/topo) ✓
+[GIT] work tree has uncommitted changes (2 file(s)) !
+[LOCKS] supervisor lock held (autopilot-topo.supervisor.lock) ·
+[LOCKS] watchdog lock held (autopilot-topo.watchdog.lock) ·
+[LOCKS] STOP flag clear ✓
+```
+Without `--verbose` the same run collapses to a roll-up (`[STATE] 7/7 checks passed ✓`) plus an overall
+`audit PASS — N passed, M failed` line. Glyphs: `✓` pass · `✗` fail · `!` warn · `·` info.
+
 ### Where to read what it did
 - `autopilot/state/decision_log.md` — narrative of every cycle (what + why + outcome).
 - `autopilot/state/done.md` / `blocked.md` / `backlog.md` — the three queues.

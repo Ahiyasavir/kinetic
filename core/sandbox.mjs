@@ -32,6 +32,7 @@
 import { exec, execFile } from 'node:child_process';
 import { readFile, writeFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
+import { isWithinWorktree } from '../lib/path-validator.mjs';
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -170,11 +171,8 @@ export class WorktreeExecutor extends SandboxExecutor {
    * @throws {IsolationViolationError}
    */
   _assertPath(filePath) {
-    const resolved = path.resolve(this.sandboxRoot, filePath);
-    const boundary = this.sandboxRoot.endsWith(path.sep)
-      ? this.sandboxRoot
-      : this.sandboxRoot + path.sep;
-    if (resolved !== this.sandboxRoot && !resolved.startsWith(boundary)) {
+    if (!isWithinWorktree(filePath, this.sandboxRoot)) {
+      const resolved = path.resolve(this.sandboxRoot, filePath);
       throw new IsolationViolationError(
         `Operation blocked: path is outside worktree. ` +
         `"${filePath}" resolves to "${resolved}" which is outside sandbox boundary "${this.sandboxRoot}". ` +
@@ -182,7 +180,7 @@ export class WorktreeExecutor extends SandboxExecutor {
         { path: filePath, sandboxRoot: this.sandboxRoot }
       );
     }
-    return resolved;
+    return path.resolve(this.sandboxRoot, filePath);
   }
 
   async execShell(cmd, opts = {}) {

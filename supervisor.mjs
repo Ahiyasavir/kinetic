@@ -59,6 +59,7 @@ import { getAdapter } from './lib/providers/index.mjs';
 import { getBestUsage, formatUsageReport } from './lib/usage-provider.mjs';
 import { resolveModelForRole, getProviderForRole } from './core/providers.mjs';
 import { nonLlmAudit } from './lib/verify.mjs';
+import { runAudit, renderAudit } from './lib/audit.mjs';
 // Intelligence Efficiency Layer (P1–P3) — deterministic helpers layered on top of the existing systems.
 import { compileContext, contextHintBlock } from './lib/context-compiler.mjs';
 import { compressContext, compressedContextBlock } from './lib/context-compressor.mjs';
@@ -940,7 +941,10 @@ async function runCycle(state) {
       return res?.text || '';
     };
     planResult = await runPlanner(task, HANDOFF_DIR, config, planInvoker, log);
-  } catch (e) { log(`Planning gate skipped (non-fatal): ${e.message}`); }
+  } catch (e) {
+    if (e instanceof RateLimitError) throw e; // quota is global — let main loop handle cooldown
+    log(`Planning gate skipped (non-fatal): ${e.message}`);
+  }
   // Inject the intent anchor (+ validated plan) into the implementer's revision block so it codes
   // against the locked goal from the first attempt.
   if (planResult && !planResult.skipped && planResult.intentMd) {
@@ -985,6 +989,16 @@ async function runCycle(state) {
     log(`RED phase — Tester writing a failing test for ${task.id}…`);
     tester = await core.runTester(testerVars, config.tester?.model);
     testerDurationMs = Date.now() - testerStartTime;
+    // Fallback: if the handoff JSON was unparseable (large testContent can corrupt JSON encoding),
+    // check whether the tester wrote the canonical on-disk file anyway and recover from that.
+    if ((!tester || !tester.testFilePath)) {
+      const canonicalPath = `autopilot/state/cycle-${state.cycle}/tests.mjs`;
+      if (existsSync(path.join(GIT_ROOT, canonicalPath))) {
+        tester = tester || {};
+        tester.testFilePath = canonicalPath;
+        log(`⚠ Tester handoff missing testFilePath — recovered from canonical path (${canonicalPath})`);
+      }
+    }
     if (tester && tester.testFilePath) {
       testFilePath = tester.testFilePath;
       testCount = tester.testCount || 0;
@@ -1001,6 +1015,7 @@ async function runCycle(state) {
     }
     } // end testerEnabled block
   } catch (err) {
+    if (err instanceof RateLimitError) throw err; // quota is global — let main loop handle cooldown
     testerDurationMs = Date.now() - testerStartTime;
     log(`⚠ Tester failed (non-fatal): ${err.message} (${(testerDurationMs / 1000).toFixed(1)}s)`);
     // Continue with implementation even if test generation fails — don't block the cycle
@@ -2310,6 +2325,25 @@ async function cmdVerify() {
   if (!audit.clean) log('  → run: node autopilot/supervisor.mjs reconcile [--apply]');
 }
 
+// Operator: deterministic system self-check (U-63). Walks five categories ([FILES] [CONFIG] [STATE]
+// [GIT] [LOCKS]) and prints a pass/fail summary by default, or one diagnostic line per check with
+// --verbose. Spends ZERO model tokens; never throws on missing/corrupt inputs.
+//   node autopilot/supervisor.mjs audit            # summary
+//   node autopilot/supervisor.mjs audit --verbose  # detailed per-check output
+async function cmdAudit() {
+  const verbose = process.argv.includes('--verbose') || process.env.KINETIC_VERBOSE === '1';
+  const result = runAudit({
+    repoRoot: REPO_ROOT,
+    stateDir: STATE_DIR,
+    statePath: STATE_PATH,
+    configPath: CONFIG_PATH,
+    lockPaths: { supervisor: LOCK_PATH, watchdog: WD_LOCK_PATH },
+    stopPath: STOP_FLAG
+  });
+  for (const line of renderAudit(result, { verbose })) log(line);
+  if (!result.ok) process.exit(1);
+}
+
 // ---------- entry ----------
 // Guard: only run the entry dispatch when invoked directly (not when imported by tests).
 // Sandbox (U-62): adding this guard is safe — it preserves CLI behavior and enables imports.
@@ -2329,11 +2363,12 @@ if (isDirectRun) {
     else if (cmd === 'usage') await cmdUsage();
     else if (cmd === 'reconcile') await cmdReconcile();
     else if (cmd === 'verify') await cmdVerify();
+    else if (cmd === 'audit') await cmdAudit();
     else if (cmd === 'list-suggestions') await cmdListSuggestions();
     else if (cmd === 'approve-suggestion') await cmdApproveSuggestion();
     else if (cmd === 'dismiss-suggestion') await cmdDismissSuggestion();
     else if (cmd === 'run' || cmd === 'resume') await cmdRun();
-    else { log(`Unknown command "${cmd}". Use: start | stop | status | reset-breaker | reset-window [ISO-ts] | reconcile [--apply] [--dedupe] | verify | add "task" | run [--no-scan] | list-suggestions | approve-suggestion | dismiss-suggestion | init | route | reprioritize`); process.exit(1); }
+    else { log(`Unknown command "${cmd}". Use: start | stop | status | reset-breaker | reset-window [ISO-ts] | reconcile [--apply] [--dedupe] | verify | audit [--verbose] | add "task" | run [--no-scan] | list-suggestions | approve-suggestion | dismiss-suggestion | init | route | reprioritize`); process.exit(1); }
   } catch (err) {
     const elapsedMs = Date.now() - supervisorStartedAt;
     const activeStep = cmd === 'run' ? 'main-loop' : `cmd-${cmd}`;

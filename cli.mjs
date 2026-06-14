@@ -53,6 +53,7 @@ export const ROUTES = {
   init: { script: 'supervisor.mjs', prepend: ['init'], summary: 'Seed state/ + starter backlog and set the deadline (= supervisor init)' },
   run: { script: 'supervisor.mjs', prepend: ['run'], summary: 'Start / resume the autonomous loop (= supervisor run)' },
   status: { script: 'supervisor.mjs', prepend: ['status'], summary: 'Print a status snapshot without touching the loop (= supervisor status)' },
+  audit: { script: 'supervisor.mjs', prepend: ['audit'], summary: 'Deterministic system self-check ([FILES] [CONFIG] [STATE] [GIT] [LOCKS]); add --verbose for per-check output' },
   start: { script: 'supervisor.mjs', prepend: ['start'], summary: 'Clear STOP + launch the watchdog detached (= supervisor start)' },
   stop: { script: 'supervisor.mjs', prepend: ['stop'], summary: 'Raise STOP + stop watchdog/supervisor (= supervisor stop)' },
   add: { script: 'supervisor.mjs', prepend: ['add'], summary: 'Queue a user task into the inbox (= supervisor add "…")' }
