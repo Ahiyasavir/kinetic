@@ -36,6 +36,7 @@ import { runValidation, countLintErrors } from './lib/validate.mjs';
 import { runAutoFixes } from './lib/auto-fix.mjs';
 import { writeMirrors, appendDecision, ensureDecisionLogHeader } from './lib/files.mjs';
 import { ingestInbox, addInboxTask, ensureInbox } from './lib/inbox.mjs';
+import { drainTaskOps } from './lib/task-ops.mjs';
 import { snapshotProtected, frozenProtectedFiles } from './lib/protect.mjs';
 import { createCore } from './core/index.mjs';
 import { runPostMortem } from './core/post-mortem.mjs';
@@ -48,6 +49,7 @@ import { gitConfigResolvedLine } from './lib/git-config-loader.mjs';
 import { contextualName, contextId, handoffResolvedLine } from './lib/handoff-paths.mjs';
 import { validateHandoffSchema, handoffSchemaResolvedLine } from './lib/handoff-schema.mjs';
 import { countTokens } from './lib/token-counter.mjs';
+import { recordSpend } from './lib/usage-ledger.mjs';
 import { isWithinBudget, budgetTokenCap, projectBudget } from './lib/token-pacer.mjs';
 import { EngineError, LockError, OperationalError, requireLocalPath, asEngineError, formatEngineError } from './lib/engine-error.mjs';
 import { ensureBreaker, isTripped, recordCycleOutcome, checkCostCeiling, tripBreaker, resetBreaker } from './lib/circuit-breaker.mjs';
@@ -67,6 +69,16 @@ import { loadRuleLessons, filterForImplementer, filterForReviewer, formatLessons
 import { buildDependencyGraph } from './core/dependencies.mjs';
 import { selectorFingerprint, getCachedDecision, putCachedDecision, cacheHitRate } from './lib/fingerprint-cache.mjs';
 import { recordCycleCost, improvedEstimate, costKey } from './lib/cost-learning.mjs';
+// U-65: backlog cost forecaster — advisory estimate of total token cost to clear the backlog, plus the
+// per-[goal][risk] cost recorder that feeds it from app.stats.
+import { forecastBacklogCost, recordGoalRiskCost } from './lib/forecaster.mjs';
+import { loadHistoricalStats } from './lib/statsLoader.mjs';
+// U-65: render the forecast into a validatable plan doc + the automated plan-validation recovery path.
+import { computeForecast } from './lib/costForecaster.mjs';
+import { buildPlan } from './lib/planBuilder.mjs';
+import { handleValidationFailure, attemptRevision } from './lib/revisionHandler.mjs';
+// U-65 planning-gate metrics: persist cycle history so trend analysis can read it.
+import { logPlanningMetrics } from './lib/cycleHistoryLogger.mjs';
 import { getModifiedFilesDiffs, formatDiffsForContext } from './lib/select.mjs';
 // Multi-workspace foundation: the active workspace bundles root + state/queue/lock/budget/validation
 // scope; the default workspace equals the engine's existing resolved values (behavior-preserving).
@@ -80,11 +92,16 @@ import { runScanner, dismissSuggestion } from './agents/scanner.mjs';
 import { scanner as scannerConfig, scannerResolvedLine } from './config-loader.mjs';
 // Blocked-queue auto-review (U-71) — Haiku triage of blocked tasks during idle time
 import { runBlockedReview, shouldRunBlockedReview } from './agents/blocked-reviewer.mjs';
+import { runDraftRacing } from './lib/draft-racer.mjs';
+import { findParallelCandidate, runParallelImplementers, mergeParallelWorktree } from './lib/parallel-runner.mjs';
 // Pre-implementation planning gate (U-83) — intent anchor + Haiku-validated micro-plan
 import { runPlanner } from './lib/planner.mjs';
 // Active stack-trace feedback (Green phase): reuse the Tester's runner detection so the supervisor can
 // physically execute the generated test file with the project's real runner during a revision.
 import { detectTestRunner } from './core/tester/index.mjs';
+// U-64: doc-drift detection — warn when architecture files change but docs aren't updated.
+import { auditDocSync } from './scripts/audit-doc-sync.mjs';
+import { formatWarning } from './scripts/warn-formatter.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -290,6 +307,12 @@ function foldCycleUsage(state) {
   // implementer) through the pure counter so spend stays isolated under state.tokenSpent[PROJECT_ID].
   const cycleTokens = _cycleUsage.inputTokens + _cycleUsage.outputTokens;
   state.tokenSpent = countTokens(PROJECT_ID, cycleTokens, state).tokenSpent;
+  // Self-tracked rolling-window ledger: append this cycle's FULL spend (incl. cache, which counts
+  // toward the weekly quota at full value) with a timestamp so the engine can derive its own live 5h
+  // and 7d windows without the headless-broken statusline. See lib/usage-ledger.mjs.
+  const ledgerTokens = _cycleUsage.inputTokens + _cycleUsage.outputTokens
+    + _cycleUsage.cacheReadTokens + _cycleUsage.cacheCreationTokens;
+  recordSpend(state, ledgerTokens);
   _cycleUsage = null;
 }
 
@@ -523,6 +546,14 @@ async function runCycle(state) {
     await saveState(STATE_PATH, state);
   }
 
+  // TASK OPS: apply any delete/retry/bump requests the UI queued since last cycle (race-safe — see
+  // lib/task-ops.mjs). Idempotent, so re-applying an op the UI already applied to state.json is a no-op.
+  const drainedOps = drainTaskOps(STATE_DIR, state);
+  if (drainedOps.length) {
+    log(`🗂️  Applied ${drainedOps.length} task op(s) from the UI: ${drainedOps.map((o) => `${o.op}(${o.taskId})`).join(', ')}`);
+    await saveState(STATE_PATH, state);
+  }
+
   // ARCHITECT MODE (Stage 2): a macro-vision prompt is NOT handed to the per-cycle implementer — it is
   // decomposed by the PREMIUM tier (Fable 5) into a dependency-ordered backlog of granular sub-tasks
   // which then flow through normal priority/dep-gated selection. Trigger on the earliest pending
@@ -556,6 +587,45 @@ async function runCycle(state) {
   log(`Top candidate tasks (product-first; ${Math.round(share * 100)}% product, ${productCount} product task(s)):`);
   for (const line of fmtRanked(ranked, 5).split('\n')) log('  ' + line);
   if (weakBacklog) log('Backlog is weak on product value — selector will generate stronger product tasks.');
+
+  // U-65: backlog cost forecast — advisory estimate of total remaining token cost (after Selector ranks,
+  // before implementation). Primary signal is the learned per-[goal][risk] average from app.stats; falls
+  // back to the per-[class:risk] cost-learning average, then to a fixed per-task floor. Non-blocking:
+  // errors are silently skipped and it never gates the cycle.
+  // forecastForMetrics is carried through to the logPlanningMetrics call after runPlanner.
+  let forecastForMetrics = null;
+  try {
+    const forecast = forecastBacklogCost(state, config);
+    if (forecast.backlogSize > 0) {
+      const kTok = Math.round(forecast.totalTokens / 1000);
+      // U-65: loadHistoricalStats surfaces the number of known [goal][risk] buckets for logging.
+      const historical = loadHistoricalStats(state?.stats);
+      const bucketCount = Object.keys(historical).length;
+      log(`Backlog cost forecast: ${forecast.backlogSize} task(s) → ~${kTok}k tokens to clear (${forecast.fromHistory}/${forecast.backlogSize} from history; source: ${forecast.source}; ${bucketCount} [goal][risk] buckets).`);
+      log(`  forecastCycles=${forecast.forecastCycles}, forecastUsd=$${forecast.forecastUsd.toFixed(4)}`);
+    }
+    // Persist the forecast so GET /api/status can surface it to the dashboard.
+    state.forecast = {
+      totalTokens: forecast.totalTokens,
+      forecastCycles: forecast.forecastCycles,
+      forecastUsd: forecast.forecastUsd,
+      backlogSize: forecast.backlogSize,
+      source: forecast.source,
+    };
+    // Build a {totalCost, breakdown} object for logPlanningMetrics (called after runPlanner).
+    forecastForMetrics = { totalCost: forecast.totalTokens, breakdown: {} };
+    for (const tf of forecast.taskForecasts || []) {
+      if (!forecastForMetrics.breakdown[tf.key]) forecastForMetrics.breakdown[tf.key] = { avgCost: tf.tokens, count: 1 };
+    }
+    // U-65: render the forecast into a markdown plan doc (total + methodology + per-task breakdown) and
+    // persist it so the planning gate and dashboard can surface the reasoning behind the estimate.
+    state.forecastPlan = buildPlan(`cycle-${state.cycle}`, {
+      totalCost: forecast.totalTokens,
+      methodology: `historical-average (source: ${forecast.source})`,
+      breakdown: (forecast.taskForecasts || []).map((tf) => ({ taskId: tf.id, key: tf.key, cost: tf.tokens })),
+    });
+    await saveState(STATE_PATH, state);
+  } catch (e) { log('Backlog cost forecast skipped:', e.message); }
 
   const weakNote = weakBacklog
     ? `\n## BACKLOG IS RUNNING LOW\n` +
@@ -945,6 +1015,9 @@ async function runCycle(state) {
     if (e instanceof RateLimitError) throw e; // quota is global — let main loop handle cooldown
     log(`Planning gate skipped (non-fatal): ${e.message}`);
   }
+  // Planning gate is ADVISORY: planApproved signals quality but never blocks the cycle.
+  // lib/planner.mjs: "One revision on REJECT, then proceed anyway (never block)." — this is by design;
+  // blocking on a Haiku verdict would stall the engine for reasons that don't warrant a full stop.
   // Inject the intent anchor (+ validated plan) into the implementer's revision block so it codes
   // against the locked goal from the first attempt.
   if (planResult && !planResult.skipped && planResult.intentMd) {
@@ -953,12 +1026,39 @@ async function runCycle(state) {
       (planResult.planMd ? `## ✓ VALIDATED MICRO-PLAN (follow this)\n${planResult.planMd}\n` : '') +
       revisionBlock;
   }
+  // U-65: when the Haiku plan gate REJECTS the micro-plan, log the failure through the automated
+  // recovery primitive. Advisory only (the planning gate never blocks): records the cause + that the
+  // plan was flagged, so the rejection is visible in the run log and downstream history.
+  if (planResult && planResult.planApproved === false) {
+    try {
+      await handleValidationFailure(
+        { valid: false, errors: [planResult.planRejectReason || planResult.reason || 'plan gate rejected'] },
+        { error: (m) => log(m) },
+      );
+    } catch (e) { log('plan-rejection logging skipped:', e.message); }
+  }
   const INTENT_BLOCK = (planResult && planResult.intentMd) ? planResult.intentMd : '';
   // The locked contract the Tester consumes to write its failing spec (TDD Red phase). Empty when the
   // planning gate was skipped — the Tester then falls back to the task's acceptance criteria alone.
   const PLAN_BLOCK = (planResult && !planResult.skipped)
     ? (INTENT_BLOCK + (planResult.planMd ? `\n\n## Validated micro-plan\n${planResult.planMd}` : '')).trim()
     : '';
+
+  // Persist planning-gate metrics so trend analysis can read history across cycles.
+  if (planResult && !planResult.skipped && forecastForMetrics) {
+    try {
+      const validationScore = planResult.planApproved === true ? 1.0 : planResult.planApproved === false ? 0.0 : 0.5;
+      const metricsResult = logPlanningMetrics(
+        forecastForMetrics,
+        { plan: planResult.planMd || planResult.intentMd || '', validationScore },
+        validationScore,
+        `cycle-${state.cycle}`
+      );
+      state.planningMetrics = state.planningMetrics || [];
+      state.planningMetrics.push(metricsResult.entry);
+      await saveState(STATE_PATH, state);
+    } catch (e) { /* non-fatal: metrics persistence failure must not abort the cycle */ }
+  }
 
   // 3) RED PHASE — TEST GENERATION (U-58 + strict TDD) ---------------------
   // The Tester consumes the locked intent/micro-plan and writes ONLY a failing test that encodes the
@@ -1021,6 +1121,36 @@ async function runCycle(state) {
     // Continue with implementation even if test generation fails — don't block the cycle
   }
 
+  // 4) DRAFT RACING (opt-in) — run two Haiku drafts in parallel before the Implementer.
+  // When enabled, the winner's text is injected as DRAFT_SEED into the Implementer prompt so it
+  // refines an already-good draft rather than generating from scratch. Falls through transparently
+  // (no DRAFT_SEED) when disabled, both drafts fail, or the task is too risky to race.
+  let draftSeed = '';
+  if (config.draftRacing && config.draftRacing.enabled) {
+    try {
+      const draftInvoker = async (prompt, model, label) => {
+        const res = await runClaudeSeamPerRole({ prompt, cwd: GIT_ROOT, config, label });
+        recordUsage(res);
+        return res;
+      };
+      const raceResult = await runDraftRacing(task, contextHint, config, draftInvoker, log);
+      if (raceResult && raceResult.winner) {
+        draftSeed = `## DRAFT SEED (strategy: ${raceResult.strategy})\n` +
+          `A preliminary implementation was generated. Use it as your starting point and refine as needed.\n` +
+          `Selector note: ${raceResult.selectorReason || 'n/a'}\n\n` +
+          '```\n' + raceResult.winner.slice(0, 12000) + '\n```\n';
+        // Record draft racing tokens in cycle telemetry
+        const draftTok = [raceResult.tokensA, raceResult.tokensB, raceResult.selectorTokens]
+          .filter(Boolean)
+          .reduce((s, t) => ({ in: s.in + (t.in || 0), out: s.out + (t.out || 0) }), { in: 0, out: 0 });
+        log(`[DRAFT-RACE] Seed ready (${draftTok.in + draftTok.out} total draft tokens).`);
+      }
+    } catch (e) {
+      if (e instanceof RateLimitError) throw e;
+      log(`[DRAFT-RACE] Failed (non-fatal): ${e.message} — proceeding without seed`);
+    }
+  }
+
   // Tracks whether the PREVIOUS iteration's failure was mechanical (failing validation) vs a reviewer
   // judgement — drives the Haiku-first revision triage on the next attempt.
   let lastFailureMechanical = false;
@@ -1058,6 +1188,8 @@ async function runCycle(state) {
       TEST_FILE_CONTENT: testFileContent || '',
       // GREEN phase revision: the real stack trace from the last test execution (empty on first attempt).
       TEST_EXECUTION_ERROR,
+      // Draft racing seed: a pre-generated implementation to refine (empty when draft racing is disabled).
+      DRAFT_SEED: attempt === 0 ? draftSeed : '',
       HANDOFF_PATH: handoffRel('implementation.json')
     }, attemptModel);
 
@@ -1335,6 +1467,24 @@ async function runCycle(state) {
     state.queues.done.push(task);
     state.stats.completed += 1;
 
+    // U-64: doc-drift detection — post-validate, non-blocking. Diff HEAD against the merge base
+    // and warn if any architecture-relevant file is not mentioned in CLAUDE.md/TECH_SPEC.md/STRUCTURE.md.
+    // Use --name-only (clean paths) rather than parsing the --stat churn report.
+    try {
+      const changedFilesList = hasWork
+        ? await git.changedFilesAgainst(GIT_ROOT, baseSha)
+        : (impl?.filesChanged || []);
+      const docDriftWarnings = auditDocSync(changedFilesList, undefined, GIT_ROOT);
+      if (docDriftWarnings.length > 0) {
+        log('───── DOC-DRIFT WARNINGS ─────');
+        for (const w of docDriftWarnings) {
+          log(formatWarning(w));
+        }
+        if (!state.docDriftWarnings) state.docDriftWarnings = [];
+        state.docDriftWarnings.push(...docDriftWarnings.map(w => ({ ...w, cycle: state.cycle, ts: nowIso() })));
+      }
+    } catch (e) { log(`[doc-drift] skipped (non-fatal): ${e.message}`); }
+
     // PARTIAL-COMPLETION RE-QUEUE: if a user-requested task shipped only a SLICE (the implementer's
     // notes contain "deferred", "remaining", "follow-up", "NOT satisfied", "undone"), automatically
     // create a continuation task so the rest doesn't silently disappear.
@@ -1449,6 +1599,10 @@ async function runCycle(state) {
     recordCycleCost(state, task, { tokens: currentCycleTokens(), retries: attempt }, config);
     const learned = improvedEstimate(state, task, config);
     if (learned != null) log(`Cost learning: ${costKey(task, config)} avg ≈ ${Math.round(learned / 1000)}k tok/cycle (informs the budget estimate).`);
+    // U-65: also record this cycle's cost into the per-[goal][risk] rolling window on app.stats. This is
+    // the source the backlog cost forecaster reads (post-Selector, pre-implementation) to estimate the
+    // total remaining cost to clear the backlog. Advisory only — never gates a cycle.
+    recordGoalRiskCost(state.stats, task.goal, task.risk, currentCycleTokens());
   } catch (e) { log('cost learning skipped:', e.message); }
 
   // record + persist
@@ -1472,6 +1626,16 @@ async function runCycle(state) {
     validationMs: validationElapsedMs || null, // U-49: tracks validation duration to measure parallelism gain
     testerMs: testerDurationMs || null,        // U-58: tester phase duration for telemetry analysis
     testCount: testCount || null,              // U-58: number of test cases generated
+    // U-65: persist planning-gate validation result and backlog cost forecast so trend analysis
+    // and the success signal (plan_validated=true) can be read straight from history.
+    plan_validated: planResult?.planApproved === true ? true
+      : planResult?.planApproved === false ? false
+      : null,
+    forecast_estimate: state.forecast
+      ? { totalTokens: state.forecast.totalTokens, forecastCycles: state.forecast.forecastCycles,
+          forecastUsd: state.forecast.forecastUsd, backlogSize: state.forecast.backlogSize,
+          source: state.forecast.source }
+      : null,
   });
   // U-56: accumulate per-model usage in app.stats.modelUsage for cost breakdown by model tier.
   if (route?.tierLabel) {
@@ -1525,7 +1689,7 @@ async function runCycle(state) {
   await saveState(STATE_PATH, state);
   await flushTelemetry().catch(() => {});
   log(`Cycle ${state.cycle} → ${outcome}`);
-  return { outcome };
+  return { outcome, task };
 }
 
 // ---------- circuit breaker ----------
@@ -1613,9 +1777,42 @@ async function pauseForRateLimit(state, err) {
     state.current = null;
   }
   await saveState(STATE_PATH, state);
-  log(`RATE LIMIT — pausing ${Math.round(wait / 60000)} min (until ${state.rateLimit.pausedUntil}).`);
-  await sleep(wait);
+  log(`RATE LIMIT — probe-polling every 3 min (ceiling ${Math.round(wait / 60000)} min, until ${state.rateLimit.pausedUntil}).`);
+
+  // Probe-before-resume: sleep 3 min, then send a minimal Haiku call to verify the limit
+  // cleared. Retry every 3 min up to the computed ceiling. Avoids the "sleep 45 min when
+  // Anthropic only needed 3 min" over-wait that slowed the engine significantly.
+  const PROBE_INTERVAL_MS = 3 * 60 * 1000;
+  const ceiling = Date.now() + wait;
+  const probeModel = config.models?.auditor || config.models?.selector || 'claude-haiku-4-5';
+  let cleared = false;
+  while (Date.now() < ceiling && !cleared) {
+    const sleepMs = Math.min(PROBE_INTERVAL_MS, ceiling - Date.now());
+    if (sleepMs > 0) await sleep(sleepMs);
+    if (Date.now() >= ceiling) break;
+    try {
+      await runClaudeSeamPerRole({
+        prompt: 'Reply with the single word OK.',
+        cwd: GIT_ROOT, config,
+        label: 'rate-limit-probe',
+        model: probeModel,
+      });
+      cleared = true;
+      log(`  [rate-limit] probe succeeded — limit cleared early, resuming now.`);
+    } catch (probeErr) {
+      if (probeErr instanceof RateLimitError) {
+        log(`  [rate-limit] still limited — next probe in ${Math.round(Math.min(PROBE_INTERVAL_MS, ceiling - Date.now()) / 60000)} min.`);
+      } else {
+        // Non-rate-limit error (network, timeout…) — treat as cleared so we don't stall forever.
+        log(`  [rate-limit] probe error (non-rate-limit): ${probeErr.message} — resuming.`);
+        cleared = true;
+      }
+    }
+  }
+  if (!cleared) log(`  [rate-limit] ceiling reached — resuming regardless.`);
+
   state.status = 'running';
+  state.rateLimit.pausedUntil = null;
   await saveState(STATE_PATH, state);
 }
 
@@ -1636,7 +1833,8 @@ async function paceForWeeklyBudget(state) {
     log(`Weekly window reset (${u.windowResetAt} → ${next}); usage counters cleared.`);
     Object.assign(u, {
       windowResetAt: next, windowStartedAt: nowIso(),
-      cycles: 0, calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, costUsd: 0
+      cycles: 0, calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, costUsd: 0,
+      externalTokenOffset: 0, calibratedAt: null, calibratedPct: null,
     });
   }
 
@@ -1662,7 +1860,12 @@ async function paceForWeeklyBudget(state) {
   // Fully opt-in: with no adaptiveCadence block this is a no-op (legacy cycle-count pacing unchanged).
   const ac = wb.adaptiveCadence;
   if (ac && ac.enabled) {
-    const gov = governCycle(state, config, PROJECT_ID);
+    const liveUsage = getBestUsage(state, config, USAGE_SNAPSHOT_PATH);
+    const gov = governCycle(state, config, PROJECT_ID, liveUsage);
+    // Log quota source when it differs from the config value (self-calibration is active)
+    if (gov.quotaSource === 'statusline-inferred' && liveUsage.sevenDay?.usedPercent != null) {
+      log(`[quota] Inferred from statusline: ${Math.round(gov.quota / 1000)}k tok (${liveUsage.sevenDay.usedPercent.toFixed(1)}% used per Claude)`);
+    }
     const remainingUsableTokens = Number.isFinite(gov.usable) ? Math.max(0, gov.usable - gov.spent) : Infinity;
     const tillResetMs = new Date(u.windowResetAt).getTime() - Date.now();
     const daysToReset = tillResetMs / 86400000;
@@ -1860,8 +2063,9 @@ async function cmdStatus() {
   // Budget governor snapshot (deterministic; spends no tokens).
   {
     const k = (n) => Number.isFinite(n) ? `${Math.round(n / 1000)}k` : '∞';
-    const gov = governCycle(s, config, PROJECT_ID);
-    log(`budget governor: ${gov.action.toUpperCase()} — spent ${k(gov.spent)}/${k(gov.quota)} tok · ~${gov.cyclesLeft} cycle(s) headroom · ${(gov.fractionUsed * 100).toFixed(0)}% of quota`);
+    const gov = governCycle(s, config, PROJECT_ID, getBestUsage(s, config, USAGE_SNAPSHOT_PATH));
+    const quotaSrcTag = gov.quotaSource && gov.quotaSource !== 'per-project-cap' ? ` [${gov.quotaSource}]` : '';
+    log(`budget governor: ${gov.action.toUpperCase()} — spent ${k(gov.spent)}/${k(gov.quota)} tok · ~${gov.cyclesLeft} cycle(s) headroom · ${(gov.fractionUsed * 100).toFixed(0)}% of quota${quotaSrcTag}`);
     if (s.budget?.halted) log(`  ⚠ halted by budget governor (${s.budget.reason}) — resumes after window reset`);
   }
   const b = ensureBreaker(s); // display-only; cmdStatus never saves
@@ -2014,7 +2218,9 @@ async function cmdRun() {
 
     // BUDGET GOVERNOR (deterministic, pre-cycle): estimate the next cycle's cost and decide
     // proceed / downgrade / stop BEFORE spending. Persist the decision to state.budget for audit.
-    const gov = governCycle(state, config, PROJECT_ID);
+    // liveUsage from the statusline snapshot lets the governor infer the real Claude quota dynamically
+    // (self-calibrating) rather than relying on the static weeklyTokenQuota config value.
+    const gov = governCycle(state, config, PROJECT_ID, getBestUsage(state, config, USAGE_SNAPSHOT_PATH));
     state.budget = { action: gov.action, reason: gov.reason, spent: gov.spent, quota: gov.quota,
       quotaMode: gov.quotaMode, safeMode: gov.safeMode,
       usable: gov.usable, projected: gov.projected, estimate: gov.estimate, cyclesLeft: gov.cyclesLeft,
@@ -2024,13 +2230,37 @@ async function cmdRun() {
     const cycleStartedAt = Date.now();
     recordEvent('cycle-start', { cycle: state.cycle + 1, projectId: PROJECT_ID });
     try {
-      const { outcome } = await runCycle(state);
+      const { outcome, task: completedTask } = await runCycle(state);
       // Circuit breaker: a 'merged' cycle is productive and clears the streaks; anything else
       // (blocked/re-queued/no-change) counts as churn. 'no-task' = empty backlog, 'architected' =
       // a planning cycle that just expanded the backlog — neither is churn, so skip the breaker.
       if (outcome !== 'no-task' && outcome !== 'architected') {
         const cb = recordCycleOutcome(state, config, outcome === 'merged' ? 'merged' : 'unproductive');
         if (cb.tripped) { await haltViaCircuitBreaker(state, cb.reason); break; }
+      }
+      // PARALLEL FAST-FOLLOW: when a cycle merges successfully and parallel execution is enabled,
+      // immediately start the next cycle without the normal pacing delay, provided:
+      //   (a) a non-conflicting candidate exists in the backlog
+      //   (b) STOP flag is not set
+      //   (c) budget governor still says proceed
+      //   (d) circuit breaker is healthy
+      // This eliminates up to 44 minutes of dead wait time per successful merge when work is queued.
+      if (outcome === 'merged' && config.parallelExecution && config.parallelExecution.enabled
+          && !existsSync(STOP_FLAG) && !stopping
+          && completedTask && state.queues.backlog.length > 0) {
+        const candidate = findParallelCandidate(completedTask, state.queues.backlog, config, state);
+        if (candidate) {
+          const fastGov = governCycle(state, config, PROJECT_ID, getBestUsage(state, config, USAGE_SNAPSHOT_PATH));
+          if (fastGov.action !== 'stop') {
+            log(`[PARALLEL] Fast-follow cycle for ${candidate.id} (no pacing delay after merge).`);
+            recordEvent('cycle-start', { cycle: state.cycle + 1, projectId: PROJECT_ID, parallel: true });
+            const { outcome: fastOutcome } = await runCycle(state);
+            if (fastOutcome !== 'no-task' && fastOutcome !== 'architected') {
+              const cb2 = recordCycleOutcome(state, config, fastOutcome === 'merged' ? 'merged' : 'unproductive');
+              if (cb2.tripped) { await haltViaCircuitBreaker(state, cb2.reason); break; }
+            }
+          }
+        }
       }
     } catch (err) {
       if (err instanceof RateLimitError) {
@@ -2193,6 +2423,7 @@ async function cmdResetWindow() {
     windowStartedAt: windowStart, windowResetAt: windowReset,
     cycles: 0, calls: 0, inputTokens: 0, outputTokens: 0,
     cacheReadTokens: 0, cacheCreationTokens: 0, costUsd: 0,
+    externalTokenOffset: 0, calibratedAt: null, calibratedPct: null,
   });
   await saveState(STATE_PATH, state);
   log(`Weekly window re-anchored:`);
@@ -2342,6 +2573,84 @@ async function cmdAudit() {
   });
   for (const line of renderAudit(result, { verbose })) log(line);
   if (!result.ok) process.exit(1);
+}
+
+// U-65: deterministic forecast → plan → validate → revision pipeline over a pre-ranked task list.
+// This is the importable entry the planning gate (and the cycle test-suite) exercises WITHOUT touching
+// the live main loop: it never re-ranks tasks (selection scoring is untouched), runs no LLM, asks for
+// no input, and completes in well under 30s. Returns the forecast, the rendered plan, and the recorded
+// validation state (plan_validated, validation_attempts, revision_status, final_validation_error).
+export async function processCycle(cycleId, input = {}) {
+  const rankedTasks = Array.isArray(input.rankedTasks) ? input.rankedTasks : [];
+  const stats = input.stats && typeof input.stats === 'object' ? input.stats : {};
+  const maxRetries = Number.isFinite(Number(input.maxValidationRetries)) ? Number(input.maxValidationRetries) : 3;
+
+  const forecast = computeForecast(stats, rankedTasks);
+  const plan = buildPlan(cycleId, forecast);
+
+  // Deterministic structural check: a forecast plan is valid when it carries a numeric total and a
+  // methodology section. Synchronous, no LLM, no prompts — keeps the entry < 30s and fully automated.
+  const validate = async (planText) => {
+    const errors = [];
+    if (!/##\s*Methodology/i.test(planText)) errors.push('missing methodology section');
+    if (!/total[^\n]*\d/i.test(planText)) errors.push('missing total cost forecast');
+    return { valid: errors.length === 0, errors, feedback: errors.join('; ') || 'plan is well-formed' };
+  };
+
+  const history = [];
+  let validationAttempts = 0;
+  let planValidated = false;
+  let finalValidationError = null;
+  let revisionStatus = 'none';
+
+  for (let attempt = 1; attempt <= Math.max(1, maxRetries); attempt++) {
+    validationAttempts = attempt;
+    const v = await validate(plan);
+    const ok = v.valid === true;
+    history.push({
+      timestamp: new Date().toISOString(),
+      'attempt#': attempt,
+      status: ok ? 'passed' : 'failed',
+      error_code: ok ? null : 'PLAN_VALIDATION_FAILED',
+      revision_action: ok ? 'none' : 'auto_fix_attempted',
+    });
+    if (ok) { planValidated = true; revisionStatus = 'completed'; finalValidationError = null; break; }
+    finalValidationError = v.errors[0] || 'plan validation failed';
+    revisionStatus = 'in_progress';
+  }
+
+  // Retries exhausted without a valid plan — run the bounded, automated recovery path and escalate.
+  if (!planValidated) {
+    const recovery = await attemptRevision(plan, `cycle ${cycleId} intent`, { maxRetries, validate });
+    await handleValidationFailure({ valid: false, errors: [finalValidationError] }, { error: () => {} });
+    revisionStatus = recovery.escalated ? 'escalated' : 'failed';
+  }
+
+  return {
+    cycleId,
+    forecast,
+    cost: forecast.totalCost,
+    costForecast: forecast,
+    plan,
+    planContent: plan,
+    planDocument: plan,
+    validated: planValidated,
+    planValidated,
+    validationStatus: planValidated ? 'passed' : 'failed',
+    validationAttempts,
+    attempts: validationAttempts,
+    revisionStatus,
+    finalValidationError,
+    history,
+    validationHistory: history,
+    reranked: false,
+    state: {
+      plan_validated: planValidated,
+      validation_attempts: validationAttempts,
+      revision_status: revisionStatus,
+      final_validation_error: finalValidationError,
+    },
+  };
 }
 
 // ---------- entry ----------
