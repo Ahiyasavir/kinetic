@@ -157,6 +157,7 @@
   "budgetGovernor": {
     "enabled": true,
     "weeklyTokenQuota": 200000000,
+    "_weeklyTokenQuota_comment": "EXPLICIT CEILING (pinned). The 'self-calibrate from statusline' design never fires in headless `claude -p` mode (the statusline only runs in the interactive UI), so the quota was resolving to 'unknown' every cycle — wiping state.budget.quota to null and breaking both the 7-Day display and calibration. Pinned to 200M (the value the engine previously inferred for this Max-tier account) so the quota is deterministic. This is a CEILING for the ENGINE's own spend; the user's interactive sessions on the same shared account are reconciled separately via POST /api/calibrate (usage.externalTokenOffset). Adjust if the real account quota differs.",
     "reserveFraction": 0.10,
     "safetyMargin": 0.15,
     "retryBuffer": 1.50,
@@ -247,6 +248,12 @@
     "context": "rushpoint-kinetic-topo",
     "_comment": "Per-role handoff file context tag (U-34), resolved by autopilot/lib/handoff-paths.mjs. `context` is inserted before the extension of every handoff basename (selection.json -> selection-rushpoint-kinetic-topo.json; same for implementation/review/audit) so two project contexts that share a handoff dir never overwrite each other. Omit `context` to derive it from the repo+goal slug (the same identity used by locks/budgets); omit the whole block (and have no derivable repo/goal) to keep the legacy generic 'selection.json' basenames (backward compatible). See autopilot/HANDOFF_STRUCTURE.md."
   },
+  "ui": {
+    "autoLaunch": true,
+    "port": 3000,
+    "openBrowser": true,
+    "_comment": "Control-center auto-launch (config-loader.mjs → { ui }). When the watchdog starts the engine it also brings up the loopback control server (ui/server.mjs) and opens it in the default browser, so running kinetic automatically opens the dashboard — no separate command. autoLaunch:false reverts to manual-only (the explicit `ui` CLI command). openBrowser:false starts the server but doesn't open a tab. port is the loopback HTTP port (127.0.0.1 only)."
+  },
   "scanner": {
     "enabled": true,
     "runDuringIdleTime": true,
@@ -287,5 +294,27 @@
     "minFileSizeLines": 200,
     "level": 2,
     "_comment": "U-81 context compression — disabled by default; enable after testing with level:2"
+  },
+  "_draftRacing_comment": "Draft Racing (lib/draft-racer.mjs): runs 2 Haiku drafts in parallel with different strategy prefixes, then a Sonnet selector picks the winner and injects it as DRAFT_SEED into the Implementer. Break-even: 2×Haiku + 1×Sonnet << 1×Opus for tasks with risk<=3. Disabled by default — enable after verifying the seed injection improves output quality. skipGoals: goals that always bypass racing (security, migrations). maxRisk: tasks above this risk level always use the standard single-implementer path.",
+  "draftRacing": {
+    "enabled": true,
+    "haikuModel": "claude-haiku-4-5",
+    "selectorModel": "claude-sonnet-4-6",
+    "maxRisk": 3,
+    "skipGoals": ["security", "migration", "data model", "schema", "scoring"],
+    "maxContextChars": 8000,
+    "maxDraftChars": 6000,
+    "timeoutMs": 120000
+  },
+  "_parallelExecution_comment": "Parallel Execution (lib/parallel-runner.mjs): after a successful merge, immediately starts the next cycle without waiting for the pacing cooldown — provided a non-conflicting task is in the backlog. This eliminates up to 44 minutes of dead wait per successful merge. Phase 2 (worktree-based true-parallel implementation) is implemented in the lib module but not yet wired; this config block enables the Phase 1 fast-follow behavior. minRiskForSerial: tasks at or above this risk always run serially. enabled: false by default — flip to true to activate fast-follow cycles.",
+  "parallelExecution": {
+    "enabled": true,
+    "minRiskForSerial": 4,
+    "worktreePrefix": "kinetic-parallel",
+    "skipGoals": ["security", "migration", "schema", "firestore", "auth"]
+  },
+  "costTracking": {
+    "enabled": true,
+    "_comment": "Per-task cost recording into app.stats (U-66). enabled:true (default) records inputTokens+outputTokens+cacheReadTokens after each completed cycle into rolling windows on app.stats.costAnalytics keyed by [goal] and [risk]. Set enabled:false to disable cost telemetry without breaking the cycle flow. Consumed by supervisor.mjs before calling recordTaskCost()."
   }
 }
