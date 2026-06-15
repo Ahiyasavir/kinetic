@@ -72,6 +72,7 @@ import { recordCycleCost, improvedEstimate, costKey } from './lib/cost-learning.
 // U-65: backlog cost forecaster — advisory estimate of total token cost to clear the backlog, plus the
 // per-[goal][risk] cost recorder that feeds it from app.stats.
 import { forecastBacklogCost, recordGoalRiskCost } from './lib/forecaster.mjs';
+import { recordTaskCost } from './lib/costAnalytics.mjs';
 import { loadHistoricalStats } from './lib/statsLoader.mjs';
 // U-65: render the forecast into a validatable plan doc + the automated plan-validation recovery path.
 import { computeForecast } from './lib/costForecaster.mjs';
@@ -96,6 +97,11 @@ import { runDraftRacing } from './lib/draft-racer.mjs';
 import { findParallelCandidate, runParallelImplementers, mergeParallelWorktree } from './lib/parallel-runner.mjs';
 // Pre-implementation planning gate (U-83) — intent anchor + Haiku-validated micro-plan
 import { runPlanner } from './lib/planner.mjs';
+// U-66: core-layer wrappers for intent-writing, plan validation, and bounded revision loop.
+// These expose named, testable entry points and update the live state flags read by /api/cycle/state.
+import { markIntentLocked } from './core/intent-writer.mjs';
+import { validatePlanViaHaiku } from './core/plan-validator.mjs';
+import { revisionLoop } from './core/revision-handler.mjs';
 // Active stack-trace feedback (Green phase): reuse the Tester's runner detection so the supervisor can
 // physically execute the generated test file with the project's real runner during a revision.
 import { detectTestRunner } from './core/tester/index.mjs';
@@ -1037,6 +1043,26 @@ async function runCycle(state) {
       );
     } catch (e) { log('plan-rejection logging skipped:', e.message); }
   }
+  // U-66: update live state with intent/plan validation flags (exposed via /api/cycle/state).
+  markIntentLocked(state, planResult);
+  state.plan_validated = planResult?.planApproved === true ? true
+    : planResult?.planApproved === false ? false : null;
+  state.validation_feedback = planResult?.planApproved === false
+    ? (planResult?.planRejectReason || planResult?.reason || 'plan validation rejected') : '';
+  // U-66: run deterministic structural re-check via core layer; advisory/non-blocking.
+  // Uses validatePlanViaHaiku (static form, no invoker) + revisionLoop to confirm plan shape.
+  if (planResult && !planResult.skipped && planResult.planMd) {
+    try {
+      const coreCheck = await revisionLoop(planResult.planMd, planResult.intentMd || '', {
+        maxRetries: 1,
+        validate: (p, i) => validatePlanViaHaiku(p, i),
+      });
+      if (!coreCheck.valid && coreCheck.feedback && !state.validation_feedback) {
+        state.validation_feedback = coreCheck.feedback;
+      }
+      log(`U-66 core validation: ${coreCheck.valid ? 'PASS' : 'ADVISORY FAIL'}${coreCheck.feedback ? ` — ${coreCheck.feedback}` : ''}`);
+    } catch (e) { /* non-fatal: core validation log must not abort the cycle */ }
+  }
   const INTENT_BLOCK = (planResult && planResult.intentMd) ? planResult.intentMd : '';
   // The locked contract the Tester consumes to write its failing spec (TDD Red phase). Empty when the
   // planning gate was skipped — the Tester then falls back to the task's acceptance criteria alone.
@@ -1603,6 +1629,18 @@ async function runCycle(state) {
     // the source the backlog cost forecaster reads (post-Selector, pre-implementation) to estimate the
     // total remaining cost to clear the backlog. Advisory only — never gates a cycle.
     recordGoalRiskCost(state.stats, task.goal, task.risk, currentCycleTokens());
+    // U-66: record this cycle's REAL cache-inclusive cost (input+output+cacheRead) into the per-[goal]
+    // and per-[risk] rolling windows on app.stats — the source for GET /api/stats/cost analytics. Read
+    // _cycleUsage while still live (foldCycleUsage clears it later, in the main loop). Advisory only.
+    // Guarded by config.costTracking.enabled (default true) so telemetry can be disabled without any
+    // cycle-flow change.
+    if (config.costTracking?.enabled !== false) {
+      recordTaskCost(state.stats, task.goal, task.risk, {
+        inputTokens: _cycleUsage?.inputTokens,
+        outputTokens: _cycleUsage?.outputTokens,
+        cacheReadTokens: _cycleUsage?.cacheReadTokens,
+      });
+    }
   } catch (e) { log('cost learning skipped:', e.message); }
 
   // record + persist
@@ -2267,7 +2305,16 @@ async function cmdRun() {
         recordEvent('error', { kind: 'rate-limit', cycle: state.cycle, message: err.message });
         const cb = recordCycleOutcome(state, config, 'rate-limit');
         if (cb.tripped) { await haltViaCircuitBreaker(state, cb.reason); break; }
+        // Fold the partial cycle's token spend into state.usage and the ledger BEFORE pausing.
+        // Without this, every rate-limited cycle's tokens are lost: foldCycleUsage only runs on
+        // the success path (below), so the ledger stays empty and state.usage stays stale during
+        // rate-limit storms — causing the 5h card to show "No pressure" while being limited.
+        foldCycleUsage(state);
         await pauseForRateLimit(state, err);
+        // pauseForRateLimit runs ~40 probe calls (3-min intervals). Their tokens accumulate in
+        // _cycleUsage too. Fold them now so probe cost isn't invisible to the budget and ledger.
+        foldCycleUsage(state);
+        await saveState(STATE_PATH, state);
         continue;
       }
       // Non-fatal cycle error: roll back to snapshot, re-queue, keep the run alive.
@@ -2283,6 +2330,10 @@ async function cmdRun() {
         state.queues.backlog.unshift(state.current);
         state.current = null;
       }
+      // Fold partial token spend from the crashed cycle so usage counters and the ledger stay
+      // accurate — same issue as the rate-limit path: without this fold, crashed-cycle tokens are
+      // lost when resetCycleUsage() runs at the start of the next cycle.
+      foldCycleUsage(state);
       await flushTelemetry();
       syncTelemetry(state);
       await saveState(STATE_PATH, state);
