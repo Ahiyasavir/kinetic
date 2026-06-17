@@ -17,85 +17,8 @@
     "applyHardeningFreeze": false
   },
   "promptProfile": "wa-assistant conventions (this workspace):\n- WhatsApp connection uses Baileys (@whiskeysockets/baileys) as a linked device — NO Playwright, NO Chrome, NO browser scraping.\n- Session files live in auth_info/ (gitignored). On first run, print QR to terminal via qrcode-terminal. Persist session via useSingleFileAuthState or useMultiFileAuthState from Baileys.\n- All DB access through src/store/db.ts singleton (better-sqlite3, synchronous). Never open a second DB connection.\n- MCP server uses stdio transport (@modelcontextprotocol/sdk). Entry point: `node dist/index.js --mcp` for MCP mode, `node dist/index.js` for daemon mode.\n- send_message tool MUST include a confirmation field in its response: the tool prepares the message but marks it 'pending' — Claude must call a confirm_send tool to actually dispatch it.\n- Hard token budgets per Claude call: summarize ≤ 800 tokens out; QA ≤ 600 tokens out; reply suggestions ≤ 200 tokens out per option (3 options max).\n- Every Claude interaction must log { operation, tokensIn, tokensOut } to ai_calls table.\n- Run the local filter pipeline (src/filter/pipeline.ts) BEFORE any context is built for Claude — if it returns 'skip', no AI call is made.\n- Strict TypeScript (strict:true), no `any`, explicit return types on all exports.\n- Honor CLAUDE.md in the project root.",
+  "_foundation_note": "FOUNDATION ALREADY IMPLEMENTED + VERIFIED in the repo (commit b3876f6): WA-STORE (src/store/* — db singleton+migrations, messages with FTS5 search/dedup, contacts with VIP+rate-limit, chats, summaries+ai_calls ledger), WA-BRIDGE (src/bridge/client.ts — QR pairing, multi-file auth session, backoff reconnect), WA-SYNC (src/bridge/handler.ts — WAMessage normalize→store, NewMessageEvent emit), WA-MCP-CORE (src/mcp/server.ts — stdio scaffold + tool registry, src/index.ts dual --mcp/daemon mode + graceful shutdown with WAL flush), WA-MCP-SEARCH (src/mcp/tools/search.ts — search_messages tool), and list_chats (src/mcp/tools/list-chats.ts). tsc clean, 11/11 store runtime smoke tests pass. The remaining seed tasks below build ON this foundation — read the existing src/ files first; do NOT re-create the store/bridge/server scaffolding.",
   "seed": [
-    {
-      "id": "WA-BRIDGE",
-      "goal": "bridge",
-      "title": "Baileys WhatsApp client: QR pairing on first run, session persistence in auth_info/, reconnect loop with exponential backoff on connection drop",
-      "dims": { "userImpact": 5, "adminImpact": 0, "reliability": 5, "productRisk": 4, "cleanupValue": 0 },
-      "effort": 3,
-      "risk": 4,
-      "deps": [],
-      "source": "seed",
-      "status": "backlog",
-      "createdCycle": 0,
-      "notes": "src/bridge/client.ts. Use makeWASocket() from @whiskeysockets/baileys with useMultiFileAuthState('auth_info'). On 'connection.update': if qr present, print with qrcode-terminal; if connection==='open', log success; if lastDisconnect.error?.output?.statusCode === 401, wipe auth_info and restart (logged-out); otherwise reconnect with backoff (1s→2s→4s→max 30s). Export a getSock() singleton. src/bridge/handler.ts registers the 'messages.upsert' listener and emits normalized MessageEvent objects."
-    },
-    {
-      "id": "WA-STORE",
-      "goal": "storage",
-      "title": "SQLite schema + migration system: contacts, chats, messages (FTS5), summaries, ai_calls tables — single db.ts singleton, schema versioning via user_version PRAGMA",
-      "dims": { "userImpact": 4, "adminImpact": 0, "reliability": 5, "productRisk": 2, "cleanupValue": 0 },
-      "effort": 3,
-      "risk": 2,
-      "deps": [],
-      "source": "seed",
-      "status": "backlog",
-      "createdCycle": 0,
-      "notes": "src/store/db.ts: open DB at data/wa.db (create data/ if missing), run migrations guarded by PRAGMA user_version. Schema: contacts(id TEXT PK, name, phone, is_vip INT DEFAULT 0, ai_calls_today INT DEFAULT 0, last_reset TEXT), chats(id TEXT PK, name, is_group INT, unread_count INT DEFAULT 0, last_msg_ts INT), messages(id TEXT PK, chat_id, sender, direction TEXT CHECK(direction IN ('in','out')), body TEXT, ts INT, media_type TEXT, ai_processed INT DEFAULT 0), summaries(id INTEGER PK AUTOINCREMENT, chat_id TEXT, summary TEXT, up_to_ts INT, tokens_used INT, created_at INT), ai_calls(id INTEGER PK AUTOINCREMENT, operation TEXT, tokens_in INT, tokens_out INT, created_at INT). FTS5: CREATE VIRTUAL TABLE messages_fts USING fts5(body, content=messages, content_rowid=rowid) — keep in sync with INSERT/UPDATE/DELETE triggers. DB path configurable via WA_DB_PATH env."
-    },
-    {
-      "id": "WA-SYNC",
-      "goal": "bridge",
-      "title": "Message sync pipeline: receive Baileys messages.upsert events, normalize to local schema, dedup by message id, upsert into SQLite — handle text, image captions, and audio (skip body for non-text)",
-      "dims": { "userImpact": 5, "adminImpact": 0, "reliability": 4, "productRisk": 3, "cleanupValue": 0 },
-      "effort": 3,
-      "risk": 3,
-      "deps": ["WA-BRIDGE", "WA-STORE"],
-      "source": "seed",
-      "status": "backlog",
-      "createdCycle": 0,
-      "notes": "src/bridge/handler.ts. On messages.upsert: for each WAMessage, extract { id: msg.key.id, chatId: msg.key.remoteJid, sender: msg.key.participant || msg.key.remoteJid, direction: msg.key.fromMe ? 'out' : 'in', body: msg.message?.conversation || msg.message?.extendedTextMessage?.text || '', ts: Number(msg.messageTimestamp), mediaType: detect from message keys (imageMessage/audioMessage/videoMessage/documentMessage or null) }. Upsert into messages with INSERT OR IGNORE (dedup by id). Update chats.unread_count and chats.last_msg_ts. For outgoing messages (fromMe), direction='out' and body is the sent text. Emit a NewMessage event for the filter pipeline."
-    },
-    {
-      "id": "WA-MCP-CORE",
-      "goal": "mcp",
-      "title": "MCP server scaffold: stdio transport via @modelcontextprotocol/sdk, tool registry, graceful error handling, --mcp CLI flag to boot MCP mode vs daemon mode",
-      "dims": { "userImpact": 5, "adminImpact": 0, "reliability": 4, "productRisk": 3, "cleanupValue": 0 },
-      "effort": 2,
-      "risk": 2,
-      "deps": ["WA-STORE"],
-      "source": "seed",
-      "status": "backlog",
-      "createdCycle": 0,
-      "notes": "src/mcp/server.ts. Create an MCP Server with name='whatsapp-assistant', version='0.1.0'. Register all tools (list_chats, get_messages, get_unread, search_messages, send_message, confirm_send, summarize_chat). Connect via StdioServerTransport from @modelcontextprotocol/sdk/server/stdio.js. src/index.ts: if process.argv.includes('--mcp') → boot bridge (to receive new messages) + MCP server; else → boot bridge + filter daemon loop. On SIGINT/SIGTERM: close MCP server gracefully, close Baileys socket, flush SQLite WAL (db.pragma('wal_checkpoint(FULL)')), exit 0."
-    },
-    {
-      "id": "WA-MCP-READ",
-      "goal": "mcp",
-      "title": "Read MCP tools: list_chats (with unread counts + last message preview), get_messages (chat_id + limit + before_ts cursor), get_unread (all chats with pending messages)",
-      "dims": { "userImpact": 5, "adminImpact": 0, "reliability": 3, "productRisk": 2, "cleanupValue": 0 },
-      "effort": 3,
-      "risk": 2,
-      "deps": ["WA-MCP-CORE", "WA-SYNC"],
-      "source": "seed",
-      "status": "backlog",
-      "createdCycle": 0,
-      "notes": "src/mcp/tools/list-chats.ts: SELECT id, name, is_group, unread_count, last_msg_ts FROM chats ORDER BY last_msg_ts DESC LIMIT 50. src/mcp/tools/get-messages.ts: params { chat_id: string, limit?: number (default 50, max 200), before_ts?: number }; SELECT from messages WHERE chat_id=? AND ts<before_ts ORDER BY ts DESC LIMIT ?. src/mcp/tools/get-unread.ts: SELECT chats.name, messages.* FROM messages JOIN chats ON messages.chat_id=chats.id WHERE messages.ai_processed=0 AND messages.direction='in' ORDER BY messages.ts DESC LIMIT 100. Each tool returns a compact JSON array — never raw message objects, always just { id, sender, body_preview (first 100 chars), ts }."
-    },
-    {
-      "id": "WA-MCP-SEARCH",
-      "goal": "mcp",
-      "title": "search_messages MCP tool: full-text search across all message bodies using SQLite FTS5 — returns ranked results with chat context, no Claude needed",
-      "dims": { "userImpact": 4, "adminImpact": 0, "reliability": 3, "productRisk": 1, "cleanupValue": 0 },
-      "effort": 2,
-      "risk": 1,
-      "deps": ["WA-MCP-CORE", "WA-STORE"],
-      "source": "seed",
-      "status": "backlog",
-      "createdCycle": 0,
-      "notes": "src/mcp/tools/search.ts. Params: { query: string, chat_id?: string (optional, filter to one chat), limit?: number (default 20) }. SQL: SELECT m.id, m.chat_id, c.name as chat_name, m.sender, m.body, m.ts FROM messages m JOIN messages_fts fts ON m.rowid=fts.rowid JOIN chats c ON m.chat_id=c.id WHERE messages_fts MATCH ? [AND m.chat_id=?] ORDER BY rank LIMIT ?. Sanitize input (strip FTS special chars: * \" ( ) OR AND NOT). Return { results: [...], total_found: number }. This is a pure local operation — Claude never needs to call the API just to search."
-    },
     {
       "id": "WA-MCP-SEND",
       "goal": "mcp",
@@ -103,11 +26,11 @@
       "dims": { "userImpact": 4, "adminImpact": 0, "reliability": 4, "productRisk": 5, "cleanupValue": 0 },
       "effort": 3,
       "risk": 5,
-      "deps": ["WA-MCP-CORE", "WA-BRIDGE"],
+      "deps": [],
       "source": "seed",
       "status": "backlog",
       "createdCycle": 0,
-      "notes": "src/mcp/tools/send-message.ts: params { chat_id, body }. Returns { pending_id: uuid, chat_name, body, warning: 'Review the message above and call confirm_send(pending_id) to dispatch.' }. Stores pending in a Map<string, PendingSend> in memory (TTL 5 min). src/mcp/tools/confirm-send.ts: params { pending_id }. Looks up the pending message, calls sock.sendMessage(chatId, { text: body }), removes from map, logs to ai_calls. If pending_id not found or expired → error. NEVER auto-confirm — Claude must surface the draft to the user and get approval before calling confirm_send."
+      "notes": "Build on the EXISTING src/mcp/server.ts (registerTool pattern — see registerListChats/registerSearch as the template) and src/bridge/client.ts getSock(). Create src/mcp/tools/send-message.ts (export registerSend) + src/mcp/tools/confirm-send.ts (export registerConfirmSend), and register both in buildServer(). send_message: params { chat_id, body } → returns { pending_id (use crypto.randomUUID), chat_name, body, warning: 'Review the message above and call confirm_send(pending_id) to dispatch.' }; store pending in a module-level Map<string, {chatId,body,expires}> with 5-min TTL. confirm_send: params { pending_id } → look up pending, call getSock()?.sendMessage(chatId, { text: body }); if sock is null → error 'bridge not connected'; remove from map; log via logAiCall('send',0,0). If pending_id missing/expired → error. NEVER auto-confirm."
     },
     {
       "id": "WA-MCP-SUMM",
@@ -116,11 +39,11 @@
       "dims": { "userImpact": 4, "adminImpact": 0, "reliability": 3, "productRisk": 3, "cleanupValue": 0 },
       "effort": 3,
       "risk": 3,
-      "deps": ["WA-MCP-CORE", "WA-STORE"],
+      "deps": [],
       "source": "seed",
       "status": "backlog",
       "createdCycle": 0,
-      "notes": "src/mcp/tools/summarize.ts. params { chat_id, force_refresh?: boolean }. Logic: (1) load latest summary from DB; (2) count messages since summary.up_to_ts — if ≤ 10 and !force_refresh, return cached summary immediately (0 tokens); (3) otherwise load messages since up_to_ts (max 100), build a compact string (each line: '[HH:MM sender]: body'), prepend previous summary if exists; (4) return a structured prompt string that Claude should use with its own API call (this tool returns the data, Claude calls itself) — OR call Claude via the CLI adapter in src/ai/client.ts if running in daemon mode. Hard output budget: 800 tokens. Store result in summaries table with created_at and tokens_used."
+      "notes": "Build on EXISTING store helpers: getLatestSummary/insertSummary/logAiCall (src/store/summaries.ts), getMessages/countMessagesSince (src/store/messages.ts). Create src/mcp/tools/summarize.ts (export registerSummarize) and register in buildServer(). params { chat_id, force_refresh?: boolean }. Logic: (1) latest = getLatestSummary(chat_id); (2) if latest && countMessagesSince(chat_id, latest.upToTs) <= 10 && !force_refresh → return cached summary text immediately (0 tokens, note 'cached'); (3) else load getMessages(chat_id, 100) since latest?.upToTs, build a compact transcript (each line '[HH:MM sender]: body'), prepend previous summary if present; (4) IMPORTANT — this MCP tool returns the assembled prompt/transcript as its text content for Claude (the connected Claude Desktop/Code session) to summarize in-context; the tool itself does NOT make a separate API call. After Claude returns a summary the user can persist it (a future persist_summary tool) — for now insertSummary on the assembled up_to_ts with tokens_used=0. Hard guidance in the returned text: 'Summarize in <=150 words, <=800 tokens.'"
     },
     {
       "id": "WA-FILTER",
@@ -129,11 +52,11 @@
       "dims": { "userImpact": 5, "adminImpact": 0, "reliability": 4, "productRisk": 2, "cleanupValue": 0 },
       "effort": 3,
       "risk": 2,
-      "deps": ["WA-SYNC"],
+      "deps": [],
       "source": "seed",
       "status": "backlog",
       "createdCycle": 0,
-      "notes": "src/filter/pipeline.ts + src/filter/rules.ts. Rules (applied in order, first match wins): (1) direction='out' → 'skip'; (2) is_group=1 AND body doesn't contain @mention of this device's JID → 'skip'; (3) body.length < 5 → 'skip'; (4) contact.is_vip = 1 → 'reply'; (5) question pattern (body ends with '?', or contains מה/האם/כמה/מתי/איפה/who/what/when/where/how) → 'notify'; (6) >= 5 unread messages from this contact → 'summarize'; (7) ai_calls_today >= 10 → 'skip' (rate limit); (8) default → 'skip'. Rate limit resets at midnight (check last_reset date). Result logged to console but never written to DB for 'skip' messages."
+      "notes": "Create src/filter/rules.ts + src/filter/pipeline.ts exporting classify(event: NewMessageEvent): 'skip'|'notify'|'summarize'|'reply'. Use EXISTING helpers: getContact/aiCallsToday (src/store/contacts.ts), the chat.unreadCount on the event. Rules (in order, first match wins): (1) message.direction==='out' → 'skip'; (2) chat.isGroup && body has no @mention of this device's JID → 'skip'; (3) body.length < 5 → 'skip'; (4) contact?.isVip → 'reply'; (5) question pattern (body trimmed ends with '?', or matches /\\b(מה|האם|כמה|מתי|איפה|who|what|when|where|how)\\b/i) → 'notify'; (6) chat.unreadCount >= 5 → 'summarize'; (7) aiCallsToday(contactId) >= 10 → 'skip' (rate limit); (8) default 'skip'. INTEGRATION: in src/index.ts daemon mode, replace the existing `// TODO(WA-FILTER)` line inside onNewMessage with `const action = classify({message,chat}); console.error('[filter]', action, who)`. Add a focused test (node --test) for classify covering each rule."
     },
     {
       "id": "WA-CONFIG",
@@ -142,24 +65,24 @@
       "dims": { "userImpact": 4, "adminImpact": 0, "reliability": 3, "productRisk": 1, "cleanupValue": 0 },
       "effort": 2,
       "risk": 1,
-      "deps": ["WA-MCP-CORE"],
+      "deps": [],
       "source": "seed",
       "status": "backlog",
       "createdCycle": 0,
-      "notes": "claude_config/claude_desktop_config.json: { mcpServers: { whatsapp: { command: 'node', args: ['<absolute-path>/dist/index.js', '--mcp'] } } }. claude_config/startup.xml: Windows Task Scheduler task that runs 'node <path>/dist/index.js' (daemon mode, NOT --mcp) at user logon, under the user's account, restart-on-failure. claude_config/setup.ps1: PowerShell script that (a) builds the project (npm run build), (b) copies the MCP config to %APPDATA%\\Claude\\claude_desktop_config.json (merging with existing), (c) registers the Task Scheduler task from startup.xml. Document in comments: Claude Desktop must be restarted after config change."
+      "notes": "The entry point already supports `--mcp` mode (src/index.ts). Create claude_config/claude_desktop_config.json: { mcpServers: { whatsapp: { command: 'node', args: ['<absolute-path>/dist/index.js', '--mcp'] } } }. claude_config/startup.xml: Windows Task Scheduler task that runs 'node <path>/dist/index.js' (daemon mode, NOT --mcp) at user logon, restart-on-failure. claude_config/setup.ps1: PowerShell that (a) npm run build, (b) merges the MCP config into %APPDATA%\\Claude\\claude_desktop_config.json (preserve existing mcpServers), (c) registers the Task Scheduler task from startup.xml via schtasks. Document in comments: Claude Desktop must be restarted after the config change."
     },
     {
-      "id": "WA-DAEMON",
-      "goal": "structure",
-      "title": "Daemon entry point: boot bridge + filter pipeline in background, log new messages with their routing decision, handle SIGINT/SIGTERM gracefully with DB flush",
-      "dims": { "userImpact": 5, "adminImpact": 0, "reliability": 4, "productRisk": 2, "cleanupValue": 0 },
+      "id": "WA-MCP-READ",
+      "goal": "mcp",
+      "title": "Remaining read MCP tools: get_messages (chat_id + limit + before_ts cursor) and get_unread (all unprocessed inbound messages) — list_chats and search_messages already exist",
+      "dims": { "userImpact": 5, "adminImpact": 0, "reliability": 3, "productRisk": 2, "cleanupValue": 0 },
       "effort": 2,
       "risk": 2,
-      "deps": ["WA-BRIDGE", "WA-SYNC", "WA-FILTER", "WA-MCP-CORE"],
+      "deps": [],
       "source": "seed",
       "status": "backlog",
       "createdCycle": 0,
-      "notes": "src/index.ts. Two modes: (A) '--mcp' → init DB + Baileys bridge + MCP server via StdioServerTransport (stdout is the MCP channel — no console.log allowed, only console.error for diagnostics); (B) default daemon → init DB + Baileys bridge, subscribe to filter pipeline events, log decisions to stderr. Shutdown handler (SIGINT/SIGTERM/uncaughtException): await sock.logout() or sock.end(), db.pragma('wal_checkpoint(FULL)'), db.close(), process.exit(0 or 1). Never process.exit() without the DB flush — SQLite WAL must be checkpointed to avoid corruption."
+      "notes": "list_chats (src/mcp/tools/list-chats.ts) and search_messages (src/mcp/tools/search.ts) are DONE — follow their exact pattern. Add src/mcp/tools/get-messages.ts (export registerGetMessages): params { chat_id, limit?, before_ts? } → use EXISTING getMessages(chatId, limit, beforeTs) from src/store/messages.ts; return compact rows { id, sender, body_preview: body.slice(0,100), ts }. Add src/mcp/tools/get-unread.ts (export registerGetUnread): add a store helper getUnprocessedInbound(limit) in messages.ts (SELECT * FROM messages WHERE ai_processed=0 AND direction='in' ORDER BY ts DESC LIMIT ?), join chat name via getChat; return compact rows grouped by chat. Register both in buildServer() (src/mcp/server.ts). Keep outputs token-lean — previews not full bodies."
     }
   ]
 }
