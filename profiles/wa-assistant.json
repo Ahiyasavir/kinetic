@@ -1,0 +1,152 @@
+{
+  "_comment": "Workspace profile for the WhatsApp Local AI Assistant. Token-efficient local AI assistant that connects to WhatsApp Web via Chrome CDP, stores history in SQLite, applies local heuristics to minimize Claude calls, and provides summarization / Q&A / auto-reply features.",
+  "id": "wa-assistant",
+  "label": "WhatsApp Local AI Assistant",
+  "goalPhases": ["structure", "scraping", "storage", "filtering", "ai", "interface", "continuous"],
+  "metadata": {
+    "domain": "local-ai-automation",
+    "repo": "wa-assistant",
+    "branch": "main",
+    "description": "Token-efficient local AI assistant for WhatsApp Web — smart message filtering, conversation summarization, auto-reply suggestions, and chat Q&A, all running locally with minimal Claude usage."
+  },
+  "selectionFilters": {
+    "shippedFeature": "cdp.?connect|playwright.*connect|mutation.?observer|sqlite.*schema|better.?sqlite|filter.*pipeline|vip.?list|rate.?limit|summar|auto.?reply|fts.*search|cli.*entry|daemon.*loop",
+    "polishIntent": "polish|improv|refin|harden|robust|edge.?case|retry|error handling|timeout|reconnect|backoff|recover|resilient|fallback|guard|sanitiz|validat",
+    "uiPolish": "cli.*color|terminal.*color|chalk|format.*output|display|highlight|table.*format|spinner|progress",
+    "hardeningKeep": "reconnect|retry|backoff|timeout|error handling|crash|recover|idempoten|race.?condition|duplicate|dedup|disconnect|stale|corrupt|lock|integrity",
+    "applyHardeningFreeze": false
+  },
+  "promptProfile": "wa-assistant conventions (this workspace):\n- NEVER call Claude directly from feature code — all AI calls go through src/ai/client.ts.\n- ALWAYS run the local filter pipeline (src/filter/pipeline.ts) before any Claude call; if pipeline returns 'skip', abort the AI call.\n- SQLite via better-sqlite3 (synchronous). All DB access through src/store/db.ts — never open a second connection.\n- Every Claude call must log { operation, tokensIn, tokensOut } to the ai_calls table.\n- Token budgets: summarization ≤ 800 tokens out, Q&A ≤ 600 tokens out, reply suggestions ≤ 200 tokens out per suggestion.\n- Playwright is read-only (DOM observation only) unless the task explicitly enables auto-reply writes.\n- Strict TypeScript: strict:true, no `any`, explicit return types on all exports.\n- Chrome connects via CDP on port 9222 (configurable via WA_CDP_PORT env). Never launch a new browser — only attach to existing.\n- Honor the conventions in CLAUDE.md.",
+  "seed": [
+    {
+      "id": "WA-CONN",
+      "goal": "structure",
+      "title": "CDP connection layer: attach Playwright to an existing Chrome session on port 9222, verify WhatsApp Web is loaded and authenticated, expose a reconnect-on-drop health loop",
+      "dims": { "userImpact": 5, "adminImpact": 0, "reliability": 5, "productRisk": 3, "cleanupValue": 0 },
+      "effort": 2,
+      "risk": 3,
+      "deps": [],
+      "source": "seed",
+      "status": "backlog",
+      "createdCycle": 0,
+      "notes": "src/browser/connection.ts. Use playwright.chromium.connectOverCDP('http://localhost:9222'). Verify the page title contains 'WhatsApp'. Expose getPage() singleton. On disconnect, retry with exponential backoff (max 5 attempts). Port configurable via WA_CDP_PORT env var."
+    },
+    {
+      "id": "WA-SCRAPE",
+      "goal": "scraping",
+      "title": "DOM scraper: read the chat list (contact name + last-message preview + unread count) and full conversation messages (body, direction, timestamp) for a given chat",
+      "dims": { "userImpact": 5, "adminImpact": 0, "reliability": 4, "productRisk": 3, "cleanupValue": 0 },
+      "effort": 3,
+      "risk": 4,
+      "deps": ["WA-CONN"],
+      "source": "seed",
+      "status": "backlog",
+      "createdCycle": 0,
+      "notes": "src/browser/scraper.ts. Use Playwright page.evaluate() to query DOM selectors. WhatsApp Web uses data-testid attributes for stable selection (e.g. [data-testid='cell-frame-container'] for chats, [data-testid='msg-container'] for messages). Return typed objects: ChatPreview[] and Message[]. Do NOT interact with the page — read only."
+    },
+    {
+      "id": "WA-STORE",
+      "goal": "storage",
+      "title": "SQLite storage layer: schema creation + CRUD for messages, contacts, summaries, and ai_calls tables; FTS5 index on message body for local search",
+      "dims": { "userImpact": 4, "adminImpact": 0, "reliability": 5, "productRisk": 2, "cleanupValue": 0 },
+      "effort": 3,
+      "risk": 2,
+      "deps": [],
+      "source": "seed",
+      "status": "backlog",
+      "createdCycle": 0,
+      "notes": "src/store/db.ts (singleton), src/store/messages.ts, src/store/contacts.ts, src/store/summaries.ts. Schema: messages(id,contact_id,direction,body,ts,ai_processed), contacts(id,name,phone,is_vip,ai_calls_today), summaries(id,contact_id,summary,up_to_ts,tokens_used,created_at), ai_calls(id,operation,tokens_in,tokens_out,cost_usd,created_at). Add FTS5 virtual table messages_fts mirroring messages.body. DB path configurable via WA_DB_PATH env (default: ./data/wa.db)."
+    },
+    {
+      "id": "WA-WATCH",
+      "goal": "scraping",
+      "title": "Message watcher: poll for new messages every N seconds, dedup against the local DB, emit only genuinely new messages to the processing pipeline",
+      "dims": { "userImpact": 5, "adminImpact": 0, "reliability": 4, "productRisk": 2, "cleanupValue": 0 },
+      "effort": 2,
+      "risk": 2,
+      "deps": ["WA-SCRAPE", "WA-STORE"],
+      "source": "seed",
+      "status": "backlog",
+      "createdCycle": 0,
+      "notes": "src/browser/watcher.ts. Polling interval default 10 s (configurable WA_POLL_INTERVAL_S). Dedup by (contact_id, ts, body hash). Emit NewMessageEvent[]. On browser disconnect, pause and wait for reconnect. Keep a watermark (last-seen ts per contact) in memory to skip already-seen messages fast without a DB query per message."
+    },
+    {
+      "id": "WA-FILTER",
+      "goal": "filtering",
+      "title": "Local filter pipeline: synchronous heuristic chain that classifies each new message as 'skip' | 'summarize' | 'reply' | 'qa' before any Claude call is made",
+      "dims": { "userImpact": 5, "adminImpact": 0, "reliability": 4, "productRisk": 3, "cleanupValue": 0 },
+      "effort": 3,
+      "risk": 2,
+      "deps": ["WA-WATCH"],
+      "source": "seed",
+      "status": "backlog",
+      "createdCycle": 0,
+      "notes": "src/filter/pipeline.ts + src/filter/rules.ts. Rules (applied in order, first match wins): (1) VIP list → always 'reply'; (2) outgoing message → 'skip'; (3) group chat + not @mentioned → 'skip'; (4) message shorter than 10 chars → 'skip'; (5) question keywords (? at end, 'מה', 'האם', 'כמה', 'מתי', 'איפה', 'who', 'what', 'when', 'where', 'how') → 'qa'; (6) 5+ new messages from same contact → 'summarize'; (7) default → 'skip'. Rate-limit: max 10 AI calls per contact per day (tracked in contacts.ai_calls_today, reset at midnight)."
+    },
+    {
+      "id": "WA-SUMM",
+      "goal": "ai",
+      "title": "Conversation summarizer: compress a conversation to a ≤800-token summary using Claude, storing it in SQLite and reusing it as context for future calls",
+      "dims": { "userImpact": 4, "adminImpact": 0, "reliability": 3, "productRisk": 3, "cleanupValue": 0 },
+      "effort": 3,
+      "risk": 3,
+      "deps": ["WA-STORE", "WA-FILTER"],
+      "source": "seed",
+      "status": "backlog",
+      "createdCycle": 0,
+      "notes": "src/ai/summarizer.ts. Input: existing summary (if any) + new messages since last summary. Send ONLY the delta + previous summary as context — never the full history. System prompt asks for a concise Hebrew/English summary in ≤150 words. Output goes to summaries table. Log tokens to ai_calls. If a summary already exists and fewer than 10 new messages arrived, skip and reuse the existing summary."
+    },
+    {
+      "id": "WA-QA",
+      "goal": "ai",
+      "title": "Chat Q&A: answer natural-language questions about chat history — local FTS5 search first, Claude only when local search returns no relevant results",
+      "dims": { "userImpact": 4, "adminImpact": 0, "reliability": 3, "productRisk": 2, "cleanupValue": 0 },
+      "effort": 3,
+      "risk": 2,
+      "deps": ["WA-STORE", "WA-SUMM"],
+      "source": "seed",
+      "status": "backlog",
+      "createdCycle": 0,
+      "notes": "src/ai/qa.ts. Flow: (1) extract keywords from question locally (split, stopword-strip); (2) FTS5 MATCH query — if ≥3 results, answer from them without Claude; (3) if FTS returns <3 results, load latest summary + top 20 messages and send to Claude with ≤600 output tokens. System prompt: answer the question in the same language as the question, cite the date/sender of evidence."
+    },
+    {
+      "id": "WA-REPLY",
+      "goal": "ai",
+      "title": "Auto-reply suggestion engine: generate 2–3 short reply options for a VIP or flagged incoming message; display to user for approval before sending",
+      "dims": { "userImpact": 4, "adminImpact": 0, "reliability": 3, "productRisk": 4, "cleanupValue": 0 },
+      "effort": 3,
+      "risk": 4,
+      "deps": ["WA-FILTER", "WA-SUMM"],
+      "source": "seed",
+      "status": "backlog",
+      "createdCycle": 0,
+      "notes": "src/ai/reply.ts. Input: last 5 messages of conversation + summary. Generate 3 options, each ≤30 words, in the detected language. Output ≤200 tokens total. NEVER send a reply automatically — always surface options to the user via the CLI and require explicit selection. Log to ai_calls."
+    },
+    {
+      "id": "WA-CLI",
+      "goal": "interface",
+      "title": "Terminal CLI: interactive commands for 'summarize <contact>', 'ask <contact> <question>', 'vip add/remove <contact>', 'stats', and 'status'",
+      "dims": { "userImpact": 4, "adminImpact": 0, "reliability": 2, "productRisk": 1, "cleanupValue": 0 },
+      "effort": 2,
+      "risk": 1,
+      "deps": ["WA-SUMM", "WA-QA", "WA-REPLY"],
+      "source": "seed",
+      "status": "backlog",
+      "createdCycle": 0,
+      "notes": "src/cli/index.ts. Simple readline loop (no heavy framework). Commands: summarize <name> → calls WA-SUMM; ask <name> <question> → calls WA-QA; vip add/remove <name> → updates contacts.is_vip; stats → prints ai_calls totals (tokens in/out, cost); status → prints watcher state + last-seen timestamps per contact. Parse contact name with fuzzy match against contacts table."
+    },
+    {
+      "id": "WA-DAEMON",
+      "goal": "structure",
+      "title": "Background daemon: orchestration loop that starts the watcher, routes NewMessageEvents through the filter pipeline, dispatches to the right AI handler, and handles graceful shutdown",
+      "dims": { "userImpact": 5, "adminImpact": 0, "reliability": 4, "productRisk": 3, "cleanupValue": 0 },
+      "effort": 2,
+      "risk": 2,
+      "deps": ["WA-WATCH", "WA-FILTER", "WA-SUMM", "WA-REPLY"],
+      "source": "seed",
+      "status": "backlog",
+      "createdCycle": 0,
+      "notes": "src/index.ts (main). On SIGINT/SIGTERM: stop watcher, flush DB WAL checkpoint, close browser connection, exit 0. On unhandled rejection: log to ai_calls table with operation='crash', then exit 1. Loop: watcher.on('message', event => { const action = pipeline.classify(event); if (action !== 'skip') dispatch(action, event); }). Concurrency: process one event at a time (no parallel Claude calls)."
+    }
+  ]
+}

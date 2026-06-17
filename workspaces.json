@@ -1,0 +1,47 @@
+{
+  "_comment": "Workspace registry. Select at runtime with: node autopilot/cli.mjs --workspace <id> <command>. List with: node autopilot/cli.mjs workspaces. Omitting --workspace uses the DEFAULT workspace (config.json-derived, always available).",
+  "default": null,
+  "workspaces": [
+    {
+      "id": "rushpoint",
+      "label": "RushPoint — Race to Tzion",
+      "root": ".",
+      "branch": "topographic-maps",
+      "integrationBranch": "autopilot/topo",
+      "baseBranch": "topographic-maps",
+      "commitPrefix": "kinetic",
+      "budgetScope": "rushpoint-kinetic-topo",
+      "profile": "rushpoint",
+      "validation": {
+        "commands": [
+          { "name": "typecheck", "cmd": "npm run typecheck", "required": true, "timeoutMs": 600000 },
+          { "name": "build-admin", "cmd": "npm run build --workspace=apps/admin", "required": true, "timeoutMs": 600000 },
+          { "name": "lint", "cmd": "npm run lint", "required": false, "timeoutMs": 600000 }
+        ],
+        "lintRegressionGuard": true,
+        "e2e": { "enabled": false, "cmd": "node scripts/e2e-verify.mjs", "timeoutMs": 600000 }
+      },
+      "boundaries": { "write": ["."], "read": ["."] }
+    },
+    {
+      "id": "wa-assistant",
+      "label": "WhatsApp Local AI Assistant",
+      "root": "../wa-assistant",
+      "branch": "main",
+      "integrationBranch": "autopilot/main",
+      "baseBranch": "main",
+      "commitPrefix": "kinetic",
+      "budgetScope": "wa-assistant-kinetic",
+      "profile": "wa-assistant",
+      "validation": {
+        "commands": [
+          { "name": "typecheck", "cmd": "npm run typecheck", "required": true, "timeoutMs": 120000 },
+          { "name": "build", "cmd": "npm run build", "required": false, "timeoutMs": 120000 }
+        ],
+        "lintRegressionGuard": false,
+        "e2e": { "enabled": false, "cmd": "", "timeoutMs": 60000 }
+      },
+      "boundaries": { "write": ["."], "read": ["."] }
+    }
+  ]
+}
