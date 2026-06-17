@@ -59,6 +59,7 @@ import { analyzeState, applyReconciliation, formatReport } from './lib/reconcile
 import { governCycle, detectQuotaMode } from './lib/budget-governor.mjs';
 import { getAdapter } from './lib/providers/index.mjs';
 import { getBestUsage, formatUsageReport } from './lib/usage-provider.mjs';
+import { measureUsage } from './lib/usage-reader.mjs';
 import { resolveModelForRole, getProviderForRole } from './core/providers.mjs';
 import { nonLlmAudit } from './lib/verify.mjs';
 import { runAudit, renderAudit } from './lib/audit.mjs';
@@ -72,7 +73,8 @@ import { recordCycleCost, improvedEstimate, costKey } from './lib/cost-learning.
 // U-65: backlog cost forecaster — advisory estimate of total token cost to clear the backlog, plus the
 // per-[goal][risk] cost recorder that feeds it from app.stats.
 import { forecastBacklogCost, recordGoalRiskCost } from './lib/forecaster.mjs';
-import { recordTaskCost } from './lib/costAnalytics.mjs';
+import { trackTaskCost } from './lib/cost-tracker.mjs';
+import { recordTaskCost } from './lib/cost-analytics.mjs';
 import { loadHistoricalStats } from './lib/statsLoader.mjs';
 // U-65: render the forecast into a validatable plan doc + the automated plan-validation recovery path.
 import { computeForecast } from './lib/costForecaster.mjs';
@@ -80,6 +82,7 @@ import { buildPlan } from './lib/planBuilder.mjs';
 import { handleValidationFailure, attemptRevision } from './lib/revisionHandler.mjs';
 // U-65 planning-gate metrics: persist cycle history so trend analysis can read it.
 import { logPlanningMetrics } from './lib/cycleHistoryLogger.mjs';
+import { classifyTestGate } from './lib/tdd-integrity.mjs';
 import { getModifiedFilesDiffs, formatDiffsForContext } from './lib/select.mjs';
 // Multi-workspace foundation: the active workspace bundles root + state/queue/lock/budget/validation
 // scope; the default workspace equals the engine's existing resolved values (behavior-preserving).
@@ -94,7 +97,11 @@ import { scanner as scannerConfig, scannerResolvedLine } from './config-loader.m
 // Blocked-queue auto-review (U-71) — Haiku triage of blocked tasks during idle time
 import { runBlockedReview, shouldRunBlockedReview } from './agents/blocked-reviewer.mjs';
 import { runDraftRacing } from './lib/draft-racer.mjs';
-import { findParallelCandidate, runParallelImplementers, mergeParallelWorktree } from './lib/parallel-runner.mjs';
+// NOTE: only findParallelCandidate is wired — it gates the serial fast-follow below (skip the pacing
+// delay when a non-conflicting task is queued). True worktree-parallel execution
+// (runParallelImplementers / mergeParallelWorktree) is implemented in parallel-runner.mjs but NOT yet
+// invoked here, so those exports are intentionally not imported.
+import { findParallelCandidate } from './lib/parallel-runner.mjs';
 // Pre-implementation planning gate (U-83) — intent anchor + Haiku-validated micro-plan
 import { runPlanner } from './lib/planner.mjs';
 // U-66: core-layer wrappers for intent-writing, plan validation, and bounded revision loop.
@@ -270,6 +277,26 @@ function titlesNearDuplicate(a, b) {
 let _cycleUsage = null;
 function resetCycleUsage() {
   _cycleUsage = { calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, costUsd: 0 };
+}
+
+// Measure TRUE account-wide usage from Claude's transcripts (lib/usage-reader.mjs) and stash the weekly
+// total on state.usage.measuredWeeklyTokens, which the budget governor's windowSpend() prefers over the
+// engine-only counters. This is what lets pacing account for the user's interactive sessions on the
+// shared account — the whole reason the loop kept hitting limits it thought it was nowhere near.
+// Best-effort: on any read failure the governor silently falls back to the legacy counters.
+function refreshMeasuredUsage(state) {
+  try {
+    const u = state.usage || (state.usage = {});
+    const weeklyStartMs = u.windowStartedAt ? new Date(u.windowStartedAt).getTime() : undefined;
+    const m = measureUsage({ weeklyStartMs });
+    if (m.available) {
+      u.measuredWeeklyTokens = m.weekly.tokens;
+      u.measuredFiveHour = m.fiveHour;
+      u.measuredByModel = m.byModel;
+      u.measuredAt = m.at;
+    }
+    return m;
+  } catch { return null; }
 }
 function recordUsage(res) {
   if (!_cycleUsage) resetCycleUsage();
@@ -533,6 +560,7 @@ async function runCycle(state) {
   const cycleStartMs = Date.now();
   await core.clearHandoff();
   resetCycleUsage(); // start a fresh per-cycle usage tally (folded into state.usage on success)
+  refreshMeasuredUsage(state); // measure TRUE account-wide usage (incl. user sessions) for this cycle's pacing
   log(`===== Cycle ${state.cycle} =====`);
 
   // INBOX: pull in any tasks the user dropped since last cycle. They go to the FRONT of the backlog
@@ -978,6 +1006,8 @@ async function runCycle(state) {
   let validationElapsedMs = 0; // U-49: last validation duration (ms); recorded in history for cycle-time analysis
   let testerDurationMs = 0; // U-58: tester phase duration (ms); recorded in history for telemetry analysis
   let testCount = 0;        // U-58: number of test cases generated; recorded in history for telemetry
+  let redVerified = null;   // TDD integrity: did the generated test actually FAIL on the pre-implementation
+                            // baseline? true=genuinely Red · false=vacuous (passed pre-impl) · null=inconclusive.
   let testExecutionError = ''; // Active Stack-Trace Feedback: last revision's real test-runner failure output (≤2000 chars)
   let autoFixResult = { fixed: false, summary: 'not run' };
   // CROSS-CYCLE MEMORY: if this task already failed review/validation in an EARLIER cycle, seed the
@@ -1136,6 +1166,23 @@ async function runCycle(state) {
         testFileContent = typeof tester.testContent === 'string' ? tester.testContent : '';
       }
       log(`✓ RED phase: ${testCount} failing test case(s) written → ${testFilePath} (${(testerDurationMs / 1000).toFixed(1)}s)`);
+      // RED INTEGRITY GATE: the Tester SELF-REPORTS "N failing test(s)" — we never trust that. Run the
+      // just-written test against the CURRENT (pre-implementation) tree and confirm it actually FAILS.
+      // A test that already passes here is vacuous (tautological / asserts only that a module is defined)
+      // and would later grant a FALSE "GREEN proof" that gates nothing — the exact hole through which
+      // latent-bug commits slip past a green build. Best-effort: any tooling error leaves redVerified=null
+      // (inconclusive) and the cycle proceeds exactly as before.
+      try {
+        const redCmd = buildTestRunCommand(testFilePath, GIT_ROOT);
+        const redRun = await SANDBOX.runShell(redCmd, { cwd: GIT_ROOT, timeout: 180_000 });
+        redVerified = redRun.code !== 0; // non-zero exit == genuinely Red (test fails on the baseline)
+        log(redVerified
+          ? `✓ RED verified: the test fails on the pre-implementation baseline — it encodes a real contract.`
+          : `⚠ RED NOT verified: the test PASSES against un-implemented code (vacuous) — a later GREEN pass will NOT be counted as behavioral proof.`);
+      } catch (e) {
+        redVerified = null; // inconclusive — runner/tooling error; fall back to prior behavior
+        log(`RED verification skipped (non-fatal): ${e.message}`);
+      }
     } else {
       log('⚠ Tester produced no test file (non-fatal, proceeding with implementation)');
     }
@@ -1357,7 +1404,17 @@ async function runCycle(state) {
           const execErr = Object.assign(new Error(`test runner exited ${testResult.code}`), testResult);
           throw execErr;
         }
-        log(`✓ GREEN: \`${testCmd}\` passed.`);
+        // Test passes after implementation — but it is only PROOF of the change if it was confirmed Red
+        // on the baseline (see RED INTEGRITY GATE above). A vacuous test that was green all along is
+        // surfaced to the reviewer as a non-blocking quality gap instead of a false ✓.
+        const gate = classifyTestGate({ redVerified, greenPassed: true });
+        if (gate.authoritative) {
+          log(`✓ GREEN: \`${testCmd}\` passed (${gate.status}).`);
+        } else {
+          log(`⚠ GREEN (discounted): \`${testCmd}\` ${gate.note}`);
+          if (!validation.results) validation.results = [];
+          validation.results.push({ name: 'tests', ok: true, tail: gate.note });
+        }
       } catch (e) {
         const combined = `${e.stdout || ''}\n${e.stderr || ''}`.trim() || e.message || 'test runner failed (no output)';
         testExecutionError = combined.slice(0, 2000); // 2000-char safety cap — prevent context-window bloat
@@ -1635,11 +1692,14 @@ async function runCycle(state) {
     // Guarded by config.costTracking.enabled (default true) so telemetry can be disabled without any
     // cycle-flow change.
     if (config.costTracking?.enabled !== false) {
-      recordTaskCost(state.stats, task.goal, task.risk, {
+      if (!state.stats.costHistory || typeof state.stats.costHistory !== 'object') state.stats.costHistory = {};
+      const _costEntry = {
         inputTokens: _cycleUsage?.inputTokens,
         outputTokens: _cycleUsage?.outputTokens,
         cacheReadTokens: _cycleUsage?.cacheReadTokens,
-      });
+      };
+      trackTaskCost(state.stats.costHistory, task.goal, task.risk, _costEntry);
+      recordTaskCost(task.id, task.goal, task.risk, _costEntry, config);
     }
   } catch (e) { log('cost learning skipped:', e.message); }
 
@@ -1664,6 +1724,7 @@ async function runCycle(state) {
     validationMs: validationElapsedMs || null, // U-49: tracks validation duration to measure parallelism gain
     testerMs: testerDurationMs || null,        // U-58: tester phase duration for telemetry analysis
     testCount: testCount || null,              // U-58: number of test cases generated
+    redVerified: redVerified,                  // TDD integrity: true=Red-confirmed · false=vacuous · null=inconclusive/no-test
     // U-65: persist planning-gate validation result and backlog cost forecast so trend analysis
     // and the success signal (plan_validated=true) can be read straight from history.
     plan_validated: planResult?.planApproved === true ? true
@@ -1867,12 +1928,20 @@ async function paceForWeeklyBudget(state) {
   // Initialize / roll the weekly window.
   if (!u.windowResetAt) { u.windowResetAt = wb.resetAt; u.windowStartedAt = nowIso(); }
   while (new Date(u.windowResetAt).getTime() <= Date.now()) {
-    const next = new Date(new Date(u.windowResetAt).getTime() + (wb.resetIntervalDays || 7) * 86400000).toISOString();
-    log(`Weekly window reset (${u.windowResetAt} → ${next}); usage counters cleared.`);
+    // Anchor the NEXT reset on calibratedResetAt when it exists and matches the window that just
+    // expired — it was set from Claude's actual usage page and is more accurate than the config
+    // anchor. After rolling we clear calibratedResetAt (marks the new estimate as "unknown until
+    // the user recalibrates"). calibratedQuota is kept — the tier ceiling doesn't change weekly.
+    const expiredReset = u.windowResetAt;
+    const anchor = (u.calibratedResetAt && Math.abs(new Date(u.calibratedResetAt) - new Date(expiredReset)) < 3600000)
+      ? u.calibratedResetAt : expiredReset;
+    const next = new Date(new Date(anchor).getTime() + (wb.resetIntervalDays || 7) * 86400000).toISOString();
+    log(`Weekly window reset (${expiredReset} → ${next}); usage counters cleared.`);
     Object.assign(u, {
-      windowResetAt: next, windowStartedAt: nowIso(),
+      windowResetAt: next, windowStartedAt: nowIso(), windowResetIsEstimated: true,
       cycles: 0, calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, costUsd: 0,
       externalTokenOffset: 0, calibratedAt: null, calibratedPct: null,
+      calibratedResetAt: null, // cleared — the next reset is estimated; recalibrate from Claude.ai
     });
   }
 
@@ -1898,6 +1967,7 @@ async function paceForWeeklyBudget(state) {
   // Fully opt-in: with no adaptiveCadence block this is a no-op (legacy cycle-count pacing unchanged).
   const ac = wb.adaptiveCadence;
   if (ac && ac.enabled) {
+    refreshMeasuredUsage(state); // ensure pacing sees the freshest true account-wide usage
     const liveUsage = getBestUsage(state, config, USAGE_SNAPSHOT_PATH);
     const gov = governCycle(state, config, PROJECT_ID, liveUsage);
     // Log quota source when it differs from the config value (self-calibration is active)
@@ -2260,7 +2330,7 @@ async function cmdRun() {
     // (self-calibrating) rather than relying on the static weeklyTokenQuota config value.
     const gov = governCycle(state, config, PROJECT_ID, getBestUsage(state, config, USAGE_SNAPSHOT_PATH));
     state.budget = { action: gov.action, reason: gov.reason, spent: gov.spent, quota: gov.quota,
-      quotaMode: gov.quotaMode, safeMode: gov.safeMode,
+      quotaMode: gov.quotaMode, safeMode: gov.safeMode, calibratedQuota: gov.calibratedQuota,
       usable: gov.usable, projected: gov.projected, estimate: gov.estimate, cyclesLeft: gov.cyclesLeft,
       fractionUsed: gov.fractionUsed, at: nowIso() };
     if (gov.action === 'stop') { await haltForBudget(state, gov); break; }

@@ -34,9 +34,10 @@ const STRINGS = {
     clickRow: 'Click a row to see why it was chosen.', close: 'Close',
     logTitle: 'Live Log', noLogs: 'No logs yet — start the engine.', currentTask: 'Current Task',
     ratePaused: 'Rate limited — resuming in', noCurrent: 'Idle',
-    calibrate: 'Calibrate', calibrateTitle: 'Calibrate Budget', calibrateHint: "Enter the % shown on Claude's usage page. The engine will adjust for your own interactive sessions that aren't tracked here.",
-    calibratePct: 'Actual % used (from Claude)', calibrateQuota: 'Quota tokens (optional)', calibrateApply: 'Apply calibration',
-    calibrateDone: 'Calibrated ✓', calibrateErr: 'Calibration failed',
+    calibrate: 'Calibrate', calibrateTitle: 'Calibrate Budget', calibrateHint: "Read these three values from claude.ai/settings/limits and enter them below. The engine will use them as ground truth.",
+    calibratePct: '% used (from Claude)', calibrateResetIn: 'Resets in (hr / min)', calibrateTier: 'Plan tier',
+    calibrateApply: 'Apply calibration',
+    calibrateDone: 'Calibrated ✓', calibrateErr: 'Calibration failed', calibrateEstimated: '(estimated)',
   },
   HE: {
     brand: 'קינטיק', subtitle: 'מנוע אוטונומי',
@@ -62,9 +63,10 @@ const STRINGS = {
     clickRow: 'לחץ על שורה כדי לראות למה נבחרה.', close: 'סגור',
     logTitle: 'לוג חי', noLogs: 'אין לוג עדיין — הפעל את המנוע.', currentTask: 'משימה נוכחית',
     ratePaused: 'מגבלת קצב — ממשיך בעוד', noCurrent: 'ממתין',
-    calibrate: 'כיוון', calibrateTitle: 'כיוון תקציב', calibrateHint: 'הזן את האחוז שמוצג בדף השימוש של Claude. המנוע יתאים את עצמו לסשנים האינטראקטיביים שלך שלא נספרים כאן.',
-    calibratePct: '% בפועל (מ-Claude)', calibrateQuota: 'טוקנים בסה"כ (אופציונלי)', calibrateApply: 'החל כיוון',
-    calibrateDone: 'כויון ✓', calibrateErr: 'כיוון נכשל',
+    calibrate: 'כיוון', calibrateTitle: 'כיוון תקציב', calibrateHint: 'קרא שלושה ערכים מ-claude.ai/settings/limits והזן אותם למטה. המנוע ישתמש בהם כמקור אמת.',
+    calibratePct: '% בשימוש (מ-Claude)', calibrateResetIn: 'מתאפס בעוד (שעות / דקות)', calibrateTier: 'רמת תוכנית',
+    calibrateApply: 'החל כיוון',
+    calibrateDone: 'כויון ✓', calibrateErr: 'כיוון נכשל', calibrateEstimated: '(הערכה)',
   },
 } as const;
 
@@ -84,10 +86,10 @@ interface BudgetState {
 }
 interface UsageState {
   status?: string | null;
-  sevenDay: { spent: number; quota: number; fractionUsed: number; cyclesLeft: number | null; resetAt: string | null; action: string };
+  sevenDay: { spent: number; quota: number; fractionUsed: number; cyclesLeft: number | null; resetAt: string | null; resetIsEstimated?: boolean; action: string; quotaSource?: string };
   fiveHour: { spent: number; entries: number; resetAt: number; msLeft: number };
   rateLimit: { paused: boolean; pausedUntil: string | null; msLeft: number; consecutiveHits: number };
-  calibration?: { calibratedAt: string; calibratedPct: number | null; externalOffset: number } | null;
+  calibration?: { calibratedAt: string; calibratedPct: number | null; externalOffset: number; calibratedQuota?: number | null; calibratedResetAt?: string | null } | null;
 }
 interface HistEntry { cycle?: number; ts?: string; outcome?: string; taskId?: string; title?: string; durationMs?: number | null; model?: string; modelTier?: string; revisions?: number; }
 interface DecisionFull { cycle: number; ts: string; task: string; title: string; goal: string; outcome: string; fields: Record<string, string>; raw: string; }
@@ -166,7 +168,9 @@ export default function App(): JSX.Element {
   const [logs, setLogs] = useState<string[]>([]);
   const [showCalibrate, setShowCalibrate] = useState(false);
   const [calibPct, setCalibPct] = useState('');
-  const [calibQuota, setCalibQuota] = useState('');
+  const [calibResetHr, setCalibResetHr] = useState('');
+  const [calibResetMin, setCalibResetMin] = useState('');
+  const [calibTier, setCalibTier] = useState('pro');
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const logTailRef = useRef<HTMLDivElement>(null);
 
@@ -245,13 +249,16 @@ export default function App(): JSX.Element {
     e.preventDefault();
     const pct = parseFloat(calibPct);
     if (isNaN(pct) || pct <= 0 || pct > 100) { flash(t.calibrateErr + ': % must be 1–100'); return; }
+    const hr = parseInt(calibResetHr || '0', 10);
+    const min = parseInt(calibResetMin || '0', 10);
+    const resetInMinutes = (isNaN(hr) ? 0 : hr) * 60 + (isNaN(min) ? 0 : min);
     setBusy(true);
     try {
-      const body: Record<string, unknown> = { ws: wsId, pctUsed: pct };
-      if (calibQuota.trim()) body.quota = Math.round(parseFloat(calibQuota.replace(/[,_]/g, '')));
+      const body: Record<string, unknown> = { ws: wsId, pctUsed: pct, tier: calibTier || 'pro' };
+      if (resetInMinutes > 0) body.resetInMinutes = resetInMinutes;
       const r = await fetch('/api/calibrate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
       if (!r.ok) { const d = await r.json().catch(() => ({})); flash(t.calibrateErr + ': ' + (d.error || r.status)); }
-      else { flash(t.calibrateDone); setShowCalibrate(false); setCalibPct(''); setCalibQuota(''); await poll(); }
+      else { flash(t.calibrateDone); setShowCalibrate(false); setCalibPct(''); setCalibResetHr(''); setCalibResetMin(''); await poll(); }
     } catch { flash(t.calibrateErr); } finally { setBusy(false); }
   }
 
@@ -415,7 +422,10 @@ export default function App(): JSX.Element {
             {usage?.sevenDay?.resetAt && (
               <div className="window-meter">
                 <span className="wm-lbl">{t.resetsIn}</span>
-                <span className="wm-val mono">{fmtCountdown(new Date(usage.sevenDay.resetAt).getTime() - Date.now())}</span>
+                <span className="wm-val mono">
+                  {fmtCountdown(new Date(usage.sevenDay.resetAt).getTime() - Date.now())}
+                  {usage.sevenDay.resetIsEstimated && <span className="dim" style={{fontSize:11,marginLeft:4}}>{t.calibrateEstimated}</span>}
+                </span>
               </div>
             )}
             <div className="token-tags">
@@ -424,9 +434,10 @@ export default function App(): JSX.Element {
             </div>
             {usage?.calibration && (
               <p className="hint calib-hint">
-                ⊕ Calibrated {usage.calibration.calibratedPct != null ? `@ ${usage.calibration.calibratedPct}%` : ''}
-                {' '}· +{k(usage.calibration.externalOffset)} external tok
-                {' '}· {new Date(usage.calibration.calibratedAt).toLocaleTimeString([], { hour12: false })}
+                ⊕ {usage.calibration.calibratedPct != null ? `${usage.calibration.calibratedPct}% ` : ''}
+                {usage.calibration.calibratedQuota ? `· ${k(usage.calibration.calibratedQuota)} quota ` : ''}
+                {usage.calibration.externalOffset > 0 ? `· +${k(usage.calibration.externalOffset)} external ` : ''}
+                · {new Date(usage.calibration.calibratedAt).toLocaleTimeString([], { hour12: false })}
               </p>
             )}
           </section>
@@ -573,15 +584,28 @@ export default function App(): JSX.Element {
                 <label className="rail-lbl">{t.calibratePct}</label>
                 <div className="calib-pct-row">
                   <input className="submit-input calib-input" type="number" min="1" max="100" step="0.1"
-                    placeholder="e.g. 48" value={calibPct} onChange={e => setCalibPct(e.target.value)} required />
+                    placeholder="e.g. 94" value={calibPct} onChange={e => setCalibPct(e.target.value)} required />
                   <span className="calib-unit">%</span>
                 </div>
               </div>
               <div className="calib-field">
-                <label className="rail-lbl">{t.calibrateQuota}</label>
-                <input className="submit-input calib-input" type="text"
-                  placeholder={`current: ${k(budget?.quota)} (leave blank to keep)`}
-                  value={calibQuota} onChange={e => setCalibQuota(e.target.value)} />
+                <label className="rail-lbl">{t.calibrateResetIn}</label>
+                <div className="calib-pct-row" style={{ gap: 6 }}>
+                  <input className="submit-input calib-input" type="number" min="0" max="168" step="1"
+                    placeholder="hr" style={{ width: 60 }} value={calibResetHr} onChange={e => setCalibResetHr(e.target.value)} />
+                  <span className="calib-unit">h</span>
+                  <input className="submit-input calib-input" type="number" min="0" max="59" step="1"
+                    placeholder="min" style={{ width: 60 }} value={calibResetMin} onChange={e => setCalibResetMin(e.target.value)} />
+                  <span className="calib-unit">m</span>
+                </div>
+              </div>
+              <div className="calib-field">
+                <label className="rail-lbl">{t.calibrateTier}</label>
+                <select className="submit-input calib-input" value={calibTier} onChange={e => setCalibTier(e.target.value)}>
+                  <option value="pro">Pro (~56M tokens/week)</option>
+                  <option value="max">Max (~200M tokens/week)</option>
+                  <option value="free">Free (~25M tokens/week)</option>
+                </select>
               </div>
               <button className="btn btn-go" type="submit" disabled={busy || !calibPct.trim()} style={{ marginTop: 8 }}>
                 {t.calibrateApply}
@@ -592,7 +616,8 @@ export default function App(): JSX.Element {
                 <span className="rail-lbl" style={{ display: 'block', marginBottom: 6 }}>Last calibration</span>
                 <span className="dim" style={{ fontSize: 12 }}>
                   {usage.calibration.calibratedPct != null ? `${usage.calibration.calibratedPct}%` : '—'}
-                  {' '}· +{k(usage.calibration.externalOffset)} external tok
+                  {usage.calibration.calibratedQuota ? ` · ${k(usage.calibration.calibratedQuota)} quota` : ''}
+                  {usage.calibration.calibratedResetAt ? ` · resets ${new Date(usage.calibration.calibratedResetAt).toLocaleString([], { hour12: false })}` : ''}
                   {' '}· {new Date(usage.calibration.calibratedAt).toLocaleString([], { hour12: false })}
                 </span>
               </div>

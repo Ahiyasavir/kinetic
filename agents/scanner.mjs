@@ -102,7 +102,6 @@ function extractImportedNames(content, filePath) {
   }
 
   // Regex fallback for TypeScript or failed AST
-  const lines = content.split('\n');
 
   // Extract from ES6 imports: import x from '...' or import { x, y } from '...'
   PATTERNS_REGEX.import_from.lastIndex = 0;
@@ -398,7 +397,6 @@ function detectDeadCode(filePath, content) {
     // Check if this line contains a return or throw statement
     if (/^return\b/.test(line) || /^throw\b/.test(line)) {
       // Look for code after return/throw on same line or following lines
-      const afterReturn = line.substring(line.indexOf(line.match(/return|throw/)[0]) + 6).trim();
 
       // Check next few lines for code (not just closing braces/comments)
       for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
@@ -528,7 +526,6 @@ function detectDeeplyNestedLogic(filePath, content) {
 function analyzeFile(filePath, content) {
   if (!content) return [];
   const issues = [];
-  const lines = content.split('\n');
 
   // Skip certain file types
   const ext = path.extname(filePath).toLowerCase();

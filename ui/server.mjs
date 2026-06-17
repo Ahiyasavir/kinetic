@@ -104,6 +104,14 @@ export async function handleRequest(req, res) {
     if (req.method === 'GET' && route === '/api/budget') {
       return send(res, 200, await api.getBudget(requireWorkspace(ws)));
     }
+    if (req.method === 'GET' && route === '/api/usage') {
+      return send(res, 200, await api.getUsage(requireWorkspace(ws)));
+    }
+    if (req.method === 'GET' && route === '/api/decisions') {
+      const n = Math.max(1, Math.min(200, Number(url.searchParams.get('n')) || 40));
+      const cy = url.searchParams.get('cycle');
+      return send(res, 200, await api.getDecisions(requireWorkspace(ws), { n, cycle: cy != null ? Number(cy) : null }));
+    }
     if (req.method === 'GET' && route === '/api/activity') {
       const n = Math.max(1, Math.min(200, Number(url.searchParams.get('n')) || 20));
       return send(res, 200, await api.getActivity(requireWorkspace(ws), n));
@@ -120,10 +128,27 @@ export async function handleRequest(req, res) {
         outputTokens: b.usage.outputTokens,
       });
     }
+    if (req.method === 'GET' && route === '/api/stats/cost') {
+      return send(res, 200, await api.getCostAnalytics(requireWorkspace(ws)));
+    }
+    // U-66: expose per-cycle intent/plan validation flags (intent_locked, plan_validated, validation_feedback).
+    if (req.method === 'GET' && route === '/api/cycle/state') {
+      return send(res, 200, await api.getCycleState(requireWorkspace(ws)));
+    }
     if (req.method === 'GET' && route === '/api/history') {
       const n = Math.max(1, Math.min(200, Number(url.searchParams.get('n')) || 50));
       const activity = await api.getActivity(requireWorkspace(ws), n);
       return send(res, 200, activity.history || []);
+    }
+    if (req.method === 'GET' && route === '/api/logs') {
+      const n = Math.max(1, Math.min(100, Number(url.searchParams.get('n')) || 25));
+      const logFile = path.join(__dirname, '..', 'run.log');
+      if (!existsSync(logFile)) return send(res, 200, { lines: [] });
+      try {
+        const content = readFileSync(logFile, 'utf8');
+        const lines = content.split('\n').filter(l => l.trim()).slice(-n);
+        return send(res, 200, { lines });
+      } catch { return send(res, 200, { lines: [] }); }
     }
     if (req.method === 'GET' && route === '/api/keys') {
       const w = requireWorkspace(ws);
@@ -139,11 +164,27 @@ export async function handleRequest(req, res) {
         const out = await api.addTask(w, body.text, body.stampMs);
         return send(res, 200, out);
       }
+      if (route === '/api/task/delete') { return send(res, 200, await api.deleteTask(w, body.taskId)); }
+      if (route === '/api/task/retry')  { return send(res, 200, await api.retryTask(w, body.taskId)); }
+      if (route === '/api/task/bump')   { return send(res, 200, await api.bumpTask(w, body.taskId)); }
       if (route === '/api/stop') { return send(res, 200, api.requestStop(w, body.reason)); }
       if (route === '/api/resume') { return send(res, 200, api.clearStop(w)); }
+      if (route === '/api/calibrate') {
+        const out = await api.calibrateUsage(w, {
+          pctUsed: body.pctUsed != null ? Number(body.pctUsed) : undefined,
+          quota: body.quota != null ? Number(body.quota) : undefined,
+          spentTokens: body.spentTokens != null ? Number(body.spentTokens) : undefined,
+          actualQuota: body.actualQuota != null ? Number(body.actualQuota) : undefined,
+          tier: body.tier != null ? String(body.tier) : undefined,
+          resetInMinutes: body.resetInMinutes != null ? Number(body.resetInMinutes) : undefined,
+        });
+        return send(res, 200, out);
+      }
       if (route === '/api/start') {
-        // The ONLY side-effecting spawn: launch the loop for this workspace (detached). Opt-in.
-        const child = spawn(process.execPath, [CLI_PATH, '--workspace', w.id, 'run'],
+        // Use `start` (not `run`): clears the STOP flag + launches the watchdog so the supervisor
+        // auto-restarts on crash. `run` starts the supervisor directly with no watchdog — after
+        // /api/stop the watchdog has also exited, so a bare `run` leaves the engine unguarded.
+        const child = spawn(process.execPath, [CLI_PATH, '--workspace', w.id, 'start'],
           { cwd: REPO_ROOT, detached: true, stdio: 'ignore' });
         child.unref();
         return send(res, 200, { workspace: w.id, started: true, pid: child.pid });

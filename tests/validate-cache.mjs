@@ -28,18 +28,29 @@ function makeCfg(cmd = 'node --version') {
   };
 }
 
+// Isolated temp git repo so the SHA signature (git rev-parse/status/diff HEAD) is computed against a
+// tiny, clean, deterministic tree. Running against the engine's own working dir ('.') made `git diff
+// HEAD` enormous and slow (minutes) whenever uncommitted churn was present, which hung the suite.
+const TMP_REPO = mkdtempSync(path.join(tmpdir(), 'rp-validate-repo-'));
+const gitIn = (args) => execSync(`git ${args}`, { cwd: TMP_REPO, stdio: 'pipe' });
+gitIn('init -q');
+gitIn('config user.email t@t.t');
+gitIn('config user.name t');
+gitIn('commit -q --allow-empty -m base');
+process.on('exit', () => { try { rmSync(TMP_REPO, { recursive: true, force: true }); } catch { /* best effort */ } });
+
 // ── cache correctness ─────────────────────────────────────────────────────
 await acheck('second call with same SHA returns cached:true', async () => {
   clearValidationCache();
   const { runValidation } = await import('../lib/validate.mjs');
   const cfg = makeCfg();
-  const r1 = await runValidation(cfg, '.');   // first call — may or may not get a real SHA
-  const r2 = await runValidation(cfg, '.');   // second call — same SHA → cache hit (if git available)
+  const r1 = await runValidation(cfg, TMP_REPO);   // first call — may or may not get a real SHA
+  const r2 = await runValidation(cfg, TMP_REPO);   // second call — same SHA → cache hit (if git available)
   if (r1.cached) {
     // First call was itself a cache hit from a previous test run (e.g. same SHA) — clear and retry.
     clearValidationCache();
-    const r3 = await runValidation(cfg, '.');
-    const r4 = await runValidation(cfg, '.');
+    const r3 = await runValidation(cfg, TMP_REPO);
+    const r4 = await runValidation(cfg, TMP_REPO);
     if (r3.cached) return; // non-git dir: null SHA → no caching (test still passes via fallback check)
     assert.equal(r3.cached, false, 'first call after clear should be a miss');
     assert.equal(r4.cached, true, 'second call should be a cache hit');
@@ -53,9 +64,9 @@ await acheck('clearValidationCache resets cache — next call is a miss', async 
   clearValidationCache();
   const { runValidation } = await import('../lib/validate.mjs');
   const cfg = makeCfg();
-  const r1 = await runValidation(cfg, '.');
+  const r1 = await runValidation(cfg, TMP_REPO);
   clearValidationCache();
-  const r2 = await runValidation(cfg, '.');
+  const r2 = await runValidation(cfg, TMP_REPO);
   assert.equal(r2.cached, false, 'after clear, second call should be a miss again');
 });
 
@@ -64,9 +75,9 @@ await acheck('different lintBaseline → different cache entry (no cross-contami
   clearValidationCache();
   const { runValidation } = await import('../lib/validate.mjs');
   const cfg = makeCfg();
-  const r0 = await runValidation(cfg, '.', 0);     // key = "${sha}:0"
-  const r5 = await runValidation(cfg, '.', 5);     // key = "${sha}:5" → separate entry
-  const r0b = await runValidation(cfg, '.', 0);    // same key as r0 → cache hit
+  const r0 = await runValidation(cfg, TMP_REPO, 0);     // key = "${sha}:0"
+  const r5 = await runValidation(cfg, TMP_REPO, 5);     // key = "${sha}:5" → separate entry
+  const r0b = await runValidation(cfg, TMP_REPO, 0);    // same key as r0 → cache hit
   // r0b must be a cache hit regardless of whether r5 was also a hit (they are separate keys).
   if (r0.cached) return; // null SHA path — no caching, skip assertion
   assert.equal(r0b.cached, true, 'same sha+baseline combo should be a cache hit');
@@ -77,8 +88,8 @@ await acheck('cached result preserves ok / results / lintErrors fields', async (
   clearValidationCache();
   const { runValidation } = await import('../lib/validate.mjs');
   const cfg = makeCfg();
-  const r1 = await runValidation(cfg, '.');
-  const r2 = await runValidation(cfg, '.');
+  const r1 = await runValidation(cfg, TMP_REPO);
+  const r2 = await runValidation(cfg, TMP_REPO);
   if (!r2.cached) return; // non-git dir — skip
   assert.equal(typeof r2.ok, 'boolean', 'ok should be boolean');
   assert.ok(Array.isArray(r2.results), 'results should be an array');
@@ -92,10 +103,10 @@ await acheck('persistent cache survives an in-process clear (L2 warms L1 on rest
   clearPersistentValidationCache(CACHE_FILE);
   const { runValidation } = await import('../lib/validate.mjs');
   const cfg = makeCfg();
-  await runValidation(cfg, '.', null, { cacheFile: CACHE_FILE }); // miss → compute → persist
+  await runValidation(cfg, TMP_REPO, null, { cacheFile: CACHE_FILE }); // miss → compute → persist
   if (!existsSync(CACHE_FILE)) return; // non-git dir: null SHA → nothing persisted; skip
   clearValidationCache();                                          // simulate a process restart (L1 gone)
-  const r2 = await runValidation(cfg, '.', null, { cacheFile: CACHE_FILE });
+  const r2 = await runValidation(cfg, TMP_REPO, null, { cacheFile: CACHE_FILE });
   assert.equal(r2.cached, true, 'after restart the persistent layer serves the hit');
   assert.equal(r2.persistent, true, 'flagged as a persistent-layer hit');
   assert.ok(r2.summary.includes('[cache-hit:persistent]'), 'summary marks the persistent hit');
@@ -105,17 +116,17 @@ await acheck('persistent cache is auto-invalidated when the validation config ch
   clearValidationCache();
   clearPersistentValidationCache(CACHE_FILE);
   const { runValidation } = await import('../lib/validate.mjs');
-  await runValidation(makeCfg('node --version'), '.', null, { cacheFile: CACHE_FILE }); // persist under configHash A
+  await runValidation(makeCfg('node --version'), TMP_REPO, null, { cacheFile: CACHE_FILE }); // persist under configHash A
   if (!existsSync(CACHE_FILE)) return; // non-git dir — skip
   clearValidationCache();
-  const r2 = await runValidation(makeCfg('node -v'), '.', null, { cacheFile: CACHE_FILE }); // different cmd → configHash B
+  const r2 = await runValidation(makeCfg('node -v'), TMP_REPO, null, { cacheFile: CACHE_FILE }); // different cmd → configHash B
   assert.equal(r2.cached, false, 'a changed toolchain produces a different key → cache miss (no stale reuse)');
 });
 
 await acheck('persistent cache without a cacheFile is a no-op (backward compatible)', async () => {
   clearValidationCache();
   const { runValidation } = await import('../lib/validate.mjs');
-  const r = await runValidation(makeCfg(), '.'); // no opts → no persistence
+  const r = await runValidation(makeCfg(), TMP_REPO); // no opts → no persistence
   assert.equal(r.persistent, false, 'persistent flag is false when no cacheFile is supplied');
 });
 

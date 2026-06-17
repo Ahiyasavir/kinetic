@@ -14,7 +14,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, openSync, closeSync, statSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { queuePaths, telemetry as telemetryConfig, telemetryResolvedLine, sandbox as sandboxConfig, sandboxResolvedLine } from './config-loader.mjs';
+import { queuePaths, telemetry as telemetryConfig, telemetryResolvedLine, sandbox as sandboxConfig, sandboxResolvedLine, ui as uiConfig, uiResolvedLine } from './config-loader.mjs';
 import { initTelemetry, recordEvent, flushTelemetry } from './lib/telemetry.mjs';
 import { lockPaths, locksResolvedLine } from './lib/lock-manager.mjs';
 import { gitConfig, gitConfigResolvedLine } from './lib/git-config-loader.mjs';
@@ -112,6 +112,41 @@ function syncKineticRepo() {
   }
 }
 
+// ---- control-center UI auto-launch (config.ui) ----
+// Brings up the loopback control server IN-PROCESS (so it lives exactly as long as the watchdog —
+// i.e. as long as kinetic is running) and opens it in the browser ONCE at startup. Fully guarded: any
+// failure here (port already in use because a manual `ui` is open, import error, no browser) is logged
+// and ignored — it can NEVER stop the supervisor from running. Disable via config.ui.autoLaunch:false.
+async function launchControlUi() {
+  if (!uiConfig.autoLaunch) return;
+  try {
+    const { startControlServer } = await import('./ui/server.mjs');
+    const { url } = await startControlServer({ port: uiConfig.port });
+    log(`control center → ${url} (loopback)`);
+    if (uiConfig.openBrowser) openInBrowser(url);
+  } catch (e) {
+    const msg = e?.message || String(e);
+    if (/EADDRINUSE/.test(msg)) {
+      const url = `http://127.0.0.1:${uiConfig.port}`;
+      log(`control center already running → ${url}`);
+      if (uiConfig.openBrowser) openInBrowser(url);
+    } else {
+      log('control UI launch skipped (non-fatal):', msg.split('\n')[0]);
+    }
+  }
+}
+
+// Open a URL in the OS default browser, detached. Best-effort, never throws.
+function openInBrowser(url) {
+  try {
+    const p = process.platform;
+    const cmd = p === 'win32' ? 'cmd' : p === 'darwin' ? 'open' : 'xdg-open';
+    const args = p === 'win32' ? ['/c', 'start', '', url] : [url];
+    const child = spawn(cmd, args, { detached: true, stdio: 'ignore' });
+    child.unref();
+  } catch (e) { log('browser open skipped:', e.message); }
+}
+
 async function main() {
   if (!acquireWatchdogLock()) process.exit(0);
   // clean shutdown of OUR lock
@@ -128,6 +163,10 @@ async function main() {
   log(telemetryResolvedLine());
   log(locksResolvedLine());
   log(gitConfigResolvedLine());
+  log(uiResolvedLine());
+  // Bring up the control-center dashboard alongside the engine (config.ui.autoLaunch). Guarded — a
+  // failure here never blocks the supervisor below.
+  await launchControlUi();
   // Sandbox isolation config (U-62): watchdog logs the sandbox seam state so startup
   // confirms whether enforcement is active or passthrough mode is in effect.
   log(sandboxResolvedLine());

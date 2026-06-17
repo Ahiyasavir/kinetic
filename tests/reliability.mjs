@@ -116,14 +116,16 @@ check('frozenProtectedFiles empty once core/.ready lifts the freeze (no false st
 });
 
 // ── prompts render with all placeholders supplied ─────────────────────────
+// Derive each template's declared {{VARS}} from the file itself (rather than a hand-maintained list
+// that goes stale as roles gain placeholders) and assert renderPrompt substitutes every one. This
+// verifies renderPrompt's substitution mechanics for each role template regardless of var churn.
 await acheck('reviewer/implementer/auditor render with no {{placeholder}} leaks', async () => {
   const dir = path.join(KINETIC_DIR, 'prompts');
-  const sets = {
-    reviewer: { TASK_JSON: '{}', TASK_CLASS: 'engine', REVIEW_POLICY: '{}', EVIDENCE: 'ok', IMPL_REPORT: '{}', VALIDATION: 'ok', INTEGRATION_BRANCH: 'b', HANDOFF_PATH: 'h' },
-    implementer: { TASK_JSON: '{}', TASK_CLASS: 'engine', CYCLE_BRANCH: 'b', REVISION_BLOCK: '', CONTEXT_HINT: '', PROFILE_RULES: '', HANDOFF_PATH: 'h' },
-    auditor: { TASK_JSON: '{}', TASK_CLASS: 'engine', EVIDENCE: 'ok', IMPL_REPORT: '{}', VALIDATION: 'ok', INTEGRATION_BRANCH: 'b', HANDOFF_PATH: 'h' },
-  };
-  for (const [name, vars] of Object.entries(sets)) {
+  const { readFileSync } = await import('node:fs');
+  for (const name of ['reviewer', 'implementer', 'auditor']) {
+    const tpl = readFileSync(path.join(dir, `${name}.md`), 'utf8');
+    const declared = [...new Set((tpl.match(/\{\{([A-Z_]+)\}\}/g) || []).map((m) => m.slice(2, -2)))];
+    const vars = Object.fromEntries(declared.map((k) => [k, `<${k}>`]));
     const out = await renderPrompt(dir, name, vars);
     assert.equal(out.match(/\{\{[A-Z_]+\}\}/g), null, `${name} has unsubstituted placeholders`);
   }

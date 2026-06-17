@@ -67,7 +67,7 @@ export class SandboxExecutor {
    * @param {object} [opts]
    * @returns {Promise<{stdout: string, stderr: string, code: number}>}
    */
-  async execShell(cmd, opts = {}) {
+  async execShell(cmd, _opts = {}) {
     throw new Error('SandboxExecutor.execShell is abstract — use WorktreeExecutor or PassthroughExecutor');
   }
 
@@ -77,7 +77,7 @@ export class SandboxExecutor {
    * @param {object} [opts]
    * @returns {Promise<{stdout: string, stderr: string, code: number}>}
    */
-  async gitCommand(args, opts = {}) {
+  async gitCommand(args, _opts = {}) {
     throw new Error('SandboxExecutor.gitCommand is abstract — use WorktreeExecutor or PassthroughExecutor');
   }
 
@@ -87,7 +87,7 @@ export class SandboxExecutor {
    * @param {string} [encoding]
    * @returns {Promise<string|Buffer>}
    */
-  async readFile(filePath, encoding = 'utf8') {
+  async readFile(filePath, _encoding = 'utf8') {
     throw new Error('SandboxExecutor.readFile is abstract — use WorktreeExecutor or PassthroughExecutor');
   }
 
@@ -98,7 +98,7 @@ export class SandboxExecutor {
    * @param {string} [encoding]
    * @returns {Promise<void>}
    */
-  async writeFile(filePath, content, encoding = 'utf8') {
+  async writeFile(filePath, _content, _encoding = 'utf8') {
     throw new Error('SandboxExecutor.writeFile is abstract — use WorktreeExecutor or PassthroughExecutor');
   }
 
@@ -108,7 +108,7 @@ export class SandboxExecutor {
    * @param {object} [opts]
    * @returns {Promise<string[]>}
    */
-  async globFiles(pattern, opts = {}) {
+  async globFiles(pattern, _opts = {}) {
     throw new Error('SandboxExecutor.globFiles is abstract — use WorktreeExecutor or PassthroughExecutor');
   }
 
@@ -116,17 +116,17 @@ export class SandboxExecutor {
    * Run a shell command (canonical public name — supervisor.mjs calls this).
    * Concrete classes delegate to execShell().
    */
-  async runShell(cmd, opts = {}) {
+  async runShell(cmd, _opts = {}) {
     throw new Error('SandboxExecutor.runShell is abstract — use WorktreeExecutor or PassthroughExecutor');
   }
 
   /** Run a bash / POSIX shell command (alias of runShell). */
-  async runBash(cmd, opts = {}) {
+  async runBash(cmd, _opts = {}) {
     throw new Error('SandboxExecutor.runBash is abstract — use WorktreeExecutor or PassthroughExecutor');
   }
 
   /** Run a PowerShell command. */
-  async runPowerShell(cmd, opts = {}) {
+  async runPowerShell(cmd, _opts = {}) {
     throw new Error('SandboxExecutor.runPowerShell is abstract — use WorktreeExecutor or PassthroughExecutor');
   }
 
@@ -135,7 +135,7 @@ export class SandboxExecutor {
    * Concrete classes delegate to gitCommand().
    * @param {string|string[]} cmdOrArgs
    */
-  async execGit(cmdOrArgs, opts = {}) {
+  async execGit(cmdOrArgs, _opts = {}) {
     throw new Error('SandboxExecutor.execGit is abstract — use WorktreeExecutor or PassthroughExecutor');
   }
 

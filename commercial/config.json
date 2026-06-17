@@ -135,7 +135,7 @@
   },
   "budgetGovernor": {
     "enabled": true,
-    "weeklyTokenQuota": 200000000,
+    "weeklyTokenQuota": 300000000,
     "reserveFraction": 0.10,
     "safetyMargin": 0.15,
     "retryBuffer": 1.50,

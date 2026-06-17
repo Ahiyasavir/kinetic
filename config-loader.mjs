@@ -210,6 +210,25 @@ export function scannerResolvedLine() {
   return `config-loaded scanner from config.json → enabled (idleTime=${scanner.runDuringIdleTime}, ignore=${scanner.ignorePaths.length} patterns)`;
 }
 
+// Control-center UI auto-launch. When the watchdog starts the engine, it can also bring up the local
+// control server (loopback HTTP) and open it in the browser — so "kinetic is running" implies "the
+// dashboard is open", with no separate command. Additive + safe: `enabled:false` keeps the prior
+// behavior (UI only via the explicit `ui` command). Defaults ON per product intent.
+const DEFAULT_UI = { autoLaunch: true, port: 3000, openBrowser: true };
+const rawUi = { ...(config.ui || {}) };
+delete rawUi._comment;
+export const ui = {
+  autoLaunch: rawUi.autoLaunch ?? DEFAULT_UI.autoLaunch,
+  port: Number(rawUi.port) || DEFAULT_UI.port,
+  openBrowser: rawUi.openBrowser ?? DEFAULT_UI.openBrowser,
+};
+
+/** Startup confirmation that UI auto-launch config was loaded. */
+export function uiResolvedLine() {
+  if (!ui.autoLaunch) return 'config-loaded ui from config.json → auto-launch disabled';
+  return `config-loaded ui from config.json → auto-launch on :${ui.port}${ui.openBrowser ? ' (opens browser)' : ''}`;
+}
+
 // Per-project token budgets (U-33). Maps a projectId (repo+goal slug) to its independent limits so the
 // kinetic can pace multiple projects/workspaces without their token counters cross-contaminating.
 // Omitting the `budgets` block keeps the engine on cadence-only pacing (no per-project cap) — fully

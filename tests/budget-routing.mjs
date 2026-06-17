@@ -5,7 +5,7 @@
 //   • providers/          — adapter interface, registry, tier resolution
 //   node autopilot/tests/budget-routing.mjs
 import assert from 'node:assert/strict';
-import { governCycle, estimateNextCycleTokens, resolveQuota, governorConfig } from '../lib/budget-governor.mjs';
+import { governCycle, estimateNextCycleTokens, resolveQuota, governorConfig, TIER_QUOTAS } from '../lib/budget-governor.mjs';
 import { pickImplementerModel, baseTier } from '../lib/route.mjs';
 import { nonLlmVerify } from '../lib/verify.mjs';
 import { getAdapter, listProviders, registerAdapter, tokensOfResult } from '../lib/providers/index.mjs';
@@ -53,6 +53,52 @@ check('no quota configured → always PROCEED (backward compatible)', () => {
 });
 check('quota falls back to per-project cap when no explicit quota', () => {
   assert.equal(resolveQuota({ budgets: { p: { maxTokensPerCycle: 5_000_000 } } }, 'p'), 5_000_000);
+});
+check('calibratedQuota from state overrides per-project cap', () => {
+  const stateWithCalibrated = { usage: { calibratedQuota: 56_000_000 } };
+  assert.equal(resolveQuota({ budgets: { p: { maxTokensPerCycle: 5_000_000 } } }, 'p', null, 0, stateWithCalibrated), 56_000_000);
+});
+check('calibratedQuota from state takes priority over config weeklyTokenQuota', () => {
+  const stateWithCalibrated = { usage: { calibratedQuota: 56_000_000 } };
+  const cfgWithQuota = { budgetGovernor: { weeklyTokenQuota: 100_000_000 } };
+  // Priority chain: live > calibrated > config, so calibrated wins
+  assert.equal(resolveQuota(cfgWithQuota, 'p', null, 0, stateWithCalibrated), 56_000_000);
+});
+check('resolveQuota with no calibrated state falls through to config', () => {
+  const stateWithout = { usage: {} };
+  const cfgWithQuota = { budgetGovernor: { weeklyTokenQuota: 100_000_000 } };
+  assert.equal(resolveQuota(cfgWithQuota, 'p', null, 0, stateWithout), 100_000_000);
+});
+check('TIER_QUOTAS maps contain expected tiers', () => {
+  assert.equal(TIER_QUOTAS.free, 25_000_000);
+  assert.equal(TIER_QUOTAS.pro, 56_000_000);
+  assert.equal(TIER_QUOTAS.max, 200_000_000);
+});
+check('governCycle with calibratedQuota in state produces correct fractionUsed', () => {
+  const proState = { usage: { inputTokens: 24_000_000, outputTokens: 24_000_000, cycles: 10, calibratedQuota: 56_000_000 } };
+  const cfgNoQuota = { budgetGovernor: { enabled: true, reserveFraction: 0.10, safetyMargin: 0, retryBuffer: 1.0, downgradeFraction: 0.80, hardStopFraction: 0.95, minCycleTokens: 50_000 } };
+  const g = governCycle(proState, cfgNoQuota, 'p');
+  // spent = 48M, quota = 56M → fractionUsed ≈ 0.857
+  assert.ok(Math.abs(g.fractionUsed - (48_000_000 / 56_000_000)) < 0.01, `fractionUsed should be ~0.857, got ${g.fractionUsed}`);
+  assert.equal(g.quota, 56_000_000);
+  // At 86% of a 56M quota with 10% reserve, usable = 50.4M, spent = 48M → should stop or downgrade
+  assert.ok(g.action === 'stop' || g.action === 'downgrade', `expected stop/downgrade at 86%, got ${g.action}`);
+});
+check('governCycle surfaces calibratedQuota into its output (for the budget block)', () => {
+  const st = { usage: { inputTokens: 1_000_000, outputTokens: 0, cycles: 1, calibratedQuota: 56_000_000 } };
+  const cfg = { budgetGovernor: { enabled: true } };
+  const g = governCycle(st, cfg, 'p');
+  assert.equal(g.calibratedQuota, 56_000_000);
+});
+check('resolveQuota honors state.budget.calibratedQuota as a fallback when usage lacks it', () => {
+  const stateBudgetOnly = { usage: {}, budget: { calibratedQuota: 56_000_000 } };
+  const cfgWithQuota = { budgetGovernor: { weeklyTokenQuota: 100_000_000 } };
+  // usage has no calibrated value → fall through to the budget block before the config ceiling
+  assert.equal(resolveQuota(cfgWithQuota, 'p', null, 0, stateBudgetOnly), 56_000_000);
+});
+check('state.usage.calibratedQuota takes priority over state.budget.calibratedQuota', () => {
+  const both = { usage: { calibratedQuota: 56_000_000 }, budget: { calibratedQuota: 25_000_000 } };
+  assert.equal(resolveQuota({}, 'p', null, 0, both), 56_000_000);
 });
 
 // ── routing ────────────────────────────────────────────────────────────────

@@ -156,8 +156,8 @@
   },
   "budgetGovernor": {
     "enabled": true,
-    "weeklyTokenQuota": 200000000,
-    "_weeklyTokenQuota_comment": "EXPLICIT CEILING (pinned). The 'self-calibrate from statusline' design never fires in headless `claude -p` mode (the statusline only runs in the interactive UI), so the quota was resolving to 'unknown' every cycle — wiping state.budget.quota to null and breaking both the 7-Day display and calibration. Pinned to 200M (the value the engine previously inferred for this Max-tier account) so the quota is deterministic. This is a CEILING for the ENGINE's own spend; the user's interactive sessions on the same shared account are reconciled separately via POST /api/calibrate (usage.externalTokenOffset). Adjust if the real account quota differs.",
+    "weeklyTokenQuota": 300000000,
+    "_weeklyTokenQuota_comment": "EXPLICIT CEILING (pinned). Headless `claude -p` mode cannot self-calibrate from the statusline, so this is the deterministic fallback. Set to 60M as a conservative Pro-tier baseline (~56M real quota + margin). For accounts on other tiers, use `POST /api/calibrate` with `tier` ('free'/'pro'/'max') or `actualQuota` (exact number) to dynamically correct — the calibrated value persists in state.usage.calibratedQuota and takes priority over this config value until a new config deploy overrides it.",
     "reserveFraction": 0.10,
     "safetyMargin": 0.15,
     "retryBuffer": 1.50,
@@ -315,6 +315,6 @@
   },
   "costTracking": {
     "enabled": true,
-    "_comment": "Per-task cost recording into app.stats (U-66). enabled:true (default) records inputTokens+outputTokens+cacheReadTokens after each completed cycle into rolling windows on app.stats.costAnalytics keyed by [goal] and [risk]. Set enabled:false to disable cost telemetry without breaking the cycle flow. Consumed by supervisor.mjs before calling recordTaskCost()."
+    "_comment": "Per-task cost recording into app.stats (U-66). enabled:true (default) records inputTokens+outputTokens+cacheReadTokens after each completed cycle into rolling windows on app.stats.costHistory keyed by [goal][risk]. Set enabled:false to disable cost telemetry without breaking the cycle flow. Consumed by supervisor.mjs via trackTaskCost(); GET /api/stats/cost reduces it via lib/cost-stats.computeStats()."
   }
 }

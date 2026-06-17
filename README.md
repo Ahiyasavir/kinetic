@@ -32,9 +32,11 @@ does the bookkeeping, git safety, validation, and rate-limit/restart survival.**
  │                  downgrades risky tasks into a smaller safe subtask, never repeats done work,
  │                  tops up the backlog when it runs low.
  │
- ├─ create per-cycle branch  kinetic/cycle-N  (off the integration branch)
+ ├─ snapshot integration HEAD (baseSha) — work happens DIRECTLY on the integration branch.
+ │   (No per-cycle branch: a separate kinetic/cycle-N raced with the implementer's own git in the
+ │    shared worktree and leaked unreviewed commits onto main. Rollback is `git reset --hard baseSha`.)
  │
- ├─ 2. IMPLEMENT → claude (implementer role)  → edits + commits on the cycle branch
+ ├─ 2. IMPLEMENT → claude (implementer role)  → edits + commits on the integration branch
  │        ↑                                       writes handoff/implementation.json
  │        │
  │   3. VALIDATE  → npm run typecheck / lint (+ optional e2e)   [deterministic]
@@ -44,16 +46,16 @@ does the bookkeeping, git safety, validation, and rate-limit/restart survival.**
  │        └──── revise → loop back to IMPLEMENT (bounded: cycle.maxReviseAttempts)
  │
  ├─ 5. FINALIZE
- │       approve + validation green → merge cycle branch into integration → task → done.md
- │       reject / out of attempts   → discard cycle branch (integration untouched) → blocked.md
+ │       approve + validation green → keep the commits on integration → task → done.md
+ │       reject / out of attempts   → `git reset --hard baseSha` (integration restored) → blocked.md
  │
  ├─ 6. write decision_log.md entry (what was chosen and why, outcome)
  └─ persist state.json + regenerate backlog.md / done.md / blocked.md, then next cycle
 ```
 
-If a Claude call hits a usage/rate limit at any point, the supervisor **discards the in-flight cycle
-branch, re-queues the task, records a pause, sleeps until the cooldown elapses, then resumes** — no
-half-finished work ever reaches the integration branch.
+If a Claude call hits a usage/rate limit at any point, the supervisor **resets the integration branch
+back to the cycle's baseSha snapshot, re-queues the task, records a pause, sleeps until the cooldown
+elapses, then resumes** — no half-finished work ever reaches the integration branch.
 
 ### Roles (the review loop)
 - **Selector** and **Reviewer** are intentionally *separate Claude invocations* from the
@@ -193,17 +195,19 @@ node autopilot/cli.mjs watchdog        # = watchdog.mjs
 node autopilot/cli.mjs config          # print the resolved config paths
 ```
 Universal arguments work on any command: `--help`, `--version`, `--config <path>`, `--debug`,
-`--verbose`. (`bin: kinetic` is wired in `autopilot/package.json` for use as a global command.)
+`--verbose`. (`bin: kinetic` → `autopilot/cli.mjs` is wired in the repo-root `package.json`, so after
+`npm link` you can invoke `kinetic <command>` globally.)
 
 ### Start (first time)
 ```powershell
 node autopilot/supervisor.mjs init     # seeds state/ + a curated starter backlog, sets the 5-day deadline
 node autopilot/supervisor.mjs run      # starts the autonomous loop
 ```
-Or via the npm scripts added to package.json:
+Or via the unified CLI / global `kinetic` bin (wired in the repo-root `package.json`):
 ```powershell
-npm run kinetic:init
-npm run kinetic
+node autopilot/cli.mjs init            # = supervisor init
+node autopilot/cli.mjs run             # = supervisor run
+kinetic run                            # after `npm link`, the global bin
 ```
 
 Leave the terminal running. To run unattended in the background:
@@ -222,7 +226,8 @@ node autopilot/supervisor.mjs run      # same command — it continues from stat
 On startup the supervisor:
 1. Loads `state.json` (cycle counter, queues, deadline, rate-limit clock).
 2. **Recovers** any interrupted cycle: re-queues the in-flight task, checks out the integration
-   branch, and deletes dangling `kinetic/cycle-*` branches (integration is always clean).
+   branch, and `git reset --hard` back to that cycle's `baseSha` snapshot so any partial commits are
+   discarded (integration is always clean).
 3. If a rate-limit cooldown is still active, sleeps until it elapses.
 4. Continues running cycles until the 5-day deadline.
 

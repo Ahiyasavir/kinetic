@@ -52,12 +52,31 @@ try {
     assert.equal(r.body.code, 'WORKSPACE_UNKNOWN');
   });
 
+  await acheck('GET /api/stats/cost?ws=<default> → cost-analytics payload shape', async () => {
+    const r = await j('/api/stats/cost?ws=' + encodeURIComponent(defaultId));
+    assert.equal(r.code, 200);
+    assert.equal(r.body.workspace, defaultId);
+    for (const k of ['byGoal', 'byRisk']) assert.ok(r.body[k] && typeof r.body[k] === 'object', `${k} present`);
+    for (const k of ['totalCycles', 'avgCostPerCycle', 'projectedWeeklySpend', 'variance']) {
+      assert.equal(typeof r.body[k], 'number', `${k} numeric`);
+      assert.ok(r.body[k] >= 0, `${k} non-negative`);
+    }
+  });
+
+  await acheck('GET /api/stats/cost with NO workspace → 400 (explicit selection required)', async () => {
+    const r = await j('/api/stats/cost');
+    assert.equal(r.code, 400);
+    assert.ok(/workspace/i.test(r.body.error));
+  });
+
   await acheck('GET / serves the static control center', async () => {
     const r = await fetch(url + '/');
     assert.equal(r.status, 200);
     assert.ok((r.headers.get('content-type') || '').includes('text/html'));
     const html = await r.text();
-    assert.ok(/Control Center/.test(html), 'the UI document');
+    // The served static document is ui/public/index.html (title "Autopilot Dashboard"); the React app
+    // renders the "Control Center" heading client-side, so assert on the static title that is actually present.
+    assert.ok(/Autopilot Dashboard/.test(html), 'the UI document');
   });
 
   await acheck('unknown route → 404', async () => {

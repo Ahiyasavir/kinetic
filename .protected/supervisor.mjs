@@ -32,6 +32,10 @@ import { writeMirrors, appendDecision, ensureDecisionLogHeader } from './lib/fil
 import { ingestInbox, addInboxTask, ensureInbox } from './lib/inbox.mjs';
 import { snapshotProtected } from './lib/protect.mjs';
 import { runTester } from './core/tester/index.mjs';
+import { forecastBacklogCost } from './lib/costForecaster.mjs';
+import { generateMicroplan } from './lib/generateMicroplan.mjs';
+import { writeIntentMarkdown } from './lib/generateIntent.mjs';
+import { logPlanningMetrics } from './lib/cycleHistoryLogger.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -256,6 +260,7 @@ function recordLesson(task, { failureType, revisionCount = 0, impl, validation, 
 async function runCycle(state) {
   state.cycle += 1;
   state.stats.cyclesRun += 1;
+  state.planningGateExecuted = false; // reset per-cycle; gate runs once, then flag stays true to skip revisions
   await clearHandoff();
   resetCycleUsage(); // start a fresh per-cycle usage tally (folded into state.usage on success)
   log(`===== Cycle ${state.cycle} =====`);
@@ -446,6 +451,31 @@ async function runCycle(state) {
   task.implementerTier = route.tier;
   task.implementerReason = route.reason;
   log(`Implementer model → ${route.tier.toUpperCase()} (${route.model}) — ${route.reason}`);
+
+  // 1.75) PLANNING GATE — backlog cost forecast + micro-plan scope-alignment check (U-65).
+  // Runs only on the FIRST execution of each cycle; revisions skip it (planningGateExecuted flag).
+  // Advisory-first: logs the forecast; the gate only blocks if score < 0.8 (threshold from intent anchor).
+  if (!state.planningGateExecuted) {
+    try {
+      const forecastResult = forecastBacklogCost(state, config);
+      const historicalStats = {};
+      for (const tf of forecastResult.taskForecasts || []) {
+        if (!historicalStats[tf.key]) historicalStats[tf.key] = { avgCost: tf.tokens, count: 1 };
+      }
+      const forecast = { totalCost: forecastResult.totalTokens, breakdown: historicalStats };
+      const microplan = generateMicroplan(forecast, ranked);
+      log(`📊 Backlog forecast: ${forecastResult.backlogSize} tasks · ~${Math.round(forecastResult.totalTokens / 1000)}k tokens · scope score ${microplan.validationScore.toFixed(2)} (${microplan.gateAllows ? 'gate ALLOWS' : 'gate BLOCKS'})`);
+      const intentResult = writeIntentMarkdown(microplan, forecast, microplan.validationScore);
+      logPlanningMetrics(forecast, microplan, microplan.validationScore, `cycle-${state.cycle}`);
+      // Write intent.md to cycle state dir (non-blocking — failure does not abort the cycle)
+      const intentPath = path.join(STATE_DIR, `cycle-${state.cycle}`, 'intent.md');
+      writeFile(intentPath, intentResult.content, 'utf8').catch(() => {});
+    } catch (e) {
+      log(`⚠️  Planning gate error (non-fatal): ${e.message}`);
+    }
+    state.planningGateExecuted = true;
+    await saveState(STATE_PATH, state);
+  }
 
   // 2) SNAPSHOT + IMPLEMENT/REVIEW loop -----------------------------------
   // Work happens directly on the integration branch; we snapshot HEAD and, on any non-approval,

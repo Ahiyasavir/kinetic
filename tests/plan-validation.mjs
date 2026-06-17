@@ -1,6 +1,6 @@
 // plan-validation.mjs — U-66: integration tests for the intent/plan/validate flow.
+// (Cost-analytics tests live in tests/cost-analytics.mjs — the live trio is cost-tracker/cost-stats/cost-projector.)
 // Run: node --test autopilot/tests/plan-validation.mjs
-// MARKER: plan-validation tests — 10 tests
 
 import { test } from 'node:test';
 import assert from 'node:assert';

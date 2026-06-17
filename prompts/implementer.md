@@ -45,6 +45,14 @@ acceptance criteria directly with the smallest correct change.
    auditor will REJECT any change beyond the task's scope. Touch existing, working code as little as
    possible; keep changes additive/reversible. A small, surgical diff is the goal, not a big one.
 1. Implement **only** this task. Do not scope-creep into unrelated changes.
+1a. **WIRING IS PART OF DONE.** Whenever you create a new module or file, the implementation is **NOT
+   complete** until it is **imported and utilized by the existing codebase** — a file nothing imports is
+   a DEAD FILE and the cycle will be blocked ("UNWIRED — imported by nothing"). Add the import + a real
+   call site in the active execution path (e.g. `supervisor.mjs`, `watchdog.mjs`, `cli.mjs`, or a
+   standard `export`). If the wiring would touch a **frozen or highly sensitive file** that you cannot
+   safely modify in this cycle, do NOT leave the file dangling: ship the file plus whatever wiring is
+   safe, and in `notes` explicitly state that the remaining wiring must be a **dedicated, explicitly
+   scoped sub-task** naming the exact file and the exact import/call site it needs.
 2. **Preserve all existing behavior** unless this task explicitly requires a change. Keep changes
    additive and reversible where possible. **Do not introduce new ESLint errors** — a regression guard
    fails the cycle if the lint-error count goes up, and you must run your project's validation commands
