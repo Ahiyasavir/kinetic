@@ -1,6 +1,6 @@
 {
   "_comment": "Workspace registry. Select at runtime with: node autopilot/cli.mjs --workspace <id> <command>. List with: node autopilot/cli.mjs workspaces. Omitting --workspace uses the DEFAULT workspace (config.json-derived, always available).",
-  "default": null,
+  "default": "wa-assistant",
   "workspaces": [
     {
       "id": "rushpoint",
