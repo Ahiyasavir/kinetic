@@ -714,7 +714,10 @@ async function runCycle(state) {
       NEXT_ID: nextTaskId(state),
       HANDOFF_PATH: handoffRel('selection.json'),
       // U-52: Inject diffs block (or empty string if no diffs) so the template always has the var.
-      MODIFIED_FILES_CONTEXT: diffsBlock || ''
+      MODIFIED_FILES_CONTEXT: diffsBlock || '',
+      // Workspace-specific project context — overrides the hardcoded default project sections in
+      // selector.md when non-empty (e.g. for external workspaces like wa-assistant).
+      PROFILE_CONTEXT: WORKSPACE.profile.selectorContext || ''
     };
 
     selection = await core.runSelector(
@@ -1373,7 +1376,8 @@ async function runCycle(state) {
             BLOCKED: fmtTasks(simState.queues.blocked, 300),
             NEXT_ID: nextTaskId(simState),
             HANDOFF_PATH: handoffRel('selection.json'),
-            MODIFIED_FILES_CONTEXT: diffsBlock || ''
+            MODIFIED_FILES_CONTEXT: diffsBlock || '',
+            PROFILE_CONTEXT: WORKSPACE.profile.selectorContext || ''
           };
 
           const nextSel = await core.runSelector(
