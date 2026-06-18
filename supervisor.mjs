@@ -83,7 +83,8 @@ import { handleValidationFailure, attemptRevision } from './lib/revisionHandler.
 // U-65 planning-gate metrics: persist cycle history so trend analysis can read it.
 import { logPlanningMetrics } from './lib/cycleHistoryLogger.mjs';
 import { classifyTestGate } from './lib/tdd-integrity.mjs';
-import { getModifiedFilesDiffs, formatDiffsForContext } from './lib/select.mjs';
+import { getModifiedFilesDiffs, formatDiffsForContext, listModifiedFiles } from './lib/select.mjs';
+import { scanCandidateConflicts, formatConflictWarning } from './lib/file-conflict-guard.mjs';
 // Multi-workspace foundation: the active workspace bundles root + state/queue/lock/budget/validation
 // scope; the default workspace equals the engine's existing resolved values (behavior-preserving).
 import { resolveActiveWorkspace } from './lib/workspace-registry.mjs';
@@ -734,6 +735,22 @@ async function runCycle(state) {
     log('Selector produced no task. Skipping cycle.');
     return { outcome: 'no-task' };
   }
+
+  // U-67: file-conflict pre-flight guard. Before committing to a task, statically scan the top-3
+  // ranked candidates' title+notes for source-path references and intersect them with the files
+  // already modified in the working tree. An overlap means the upcoming edit surface collides with
+  // uncommitted in-flight work (likely rebase/merge churn). Advisory only — we log + record it on
+  // state but never block the pick; a failing git/scan is swallowed so it can't stall a cycle.
+  try {
+    if (config.fileConflictGuard !== false) {
+      const conflict = scanCandidateConflicts(ranked, listModifiedFiles(GIT_ROOT), { topN: 3 });
+      state.fileConflictGuard = { cycle: state.cycle, ...conflict };
+      if (conflict.conflicts.length) {
+        log('File-conflict pre-flight guard:');
+        for (const line of formatConflictWarning(conflict).split('\n')) log('  ' + line);
+      }
+    }
+  } catch (e) { log('File-conflict guard skipped:', e.message); }
 
   // Merge any newly proposed backlog tasks (dedup by id/title; auto-drop obvious rebuilds).
   if (Array.isArray(selection.newBacklog)) {

@@ -19,6 +19,7 @@ import { checkEvidence, hasStructuredArtifacts } from '../lib/evidence.mjs';
 import { analyzeState, applyReconciliation } from '../lib/reconcile.mjs';
 import { recordCycleOutcome } from '../lib/circuit-breaker.mjs';
 import { frozenProtectedFiles } from '../lib/protect.mjs';
+import { extractFilePaths, scanCandidateConflicts, formatConflictWarning } from '../lib/file-conflict-guard.mjs';
 import { renderPrompt } from '../core/runtime.mjs';
 
 let passed = 0;
@@ -113,6 +114,33 @@ check('circuit breaker still trips on consecutive crashes', () => {
 // ── structural-block guard input ──────────────────────────────────────────
 check('frozenProtectedFiles empty once core/.ready lifts the freeze (no false structural blocks)', () => {
   assert.equal(frozenProtectedFiles().length, 0);
+});
+
+// ── file-conflict pre-flight guard (U-67) ─────────────────────────────────
+check('extractFilePaths finds the four source roots and ignores prose/punctuation', () => {
+  const refs = extractFilePaths('Refactor lib/select.mjs and apps/admin/src/api.ts. See src/util.js, functions/index.ts;');
+  assert.deepEqual(refs.sort(), ['apps/admin/src/api.ts', 'functions/index.ts', 'lib/select.mjs', 'src/util.js']);
+  assert.deepEqual(extractFilePaths('no paths here at all'), []);
+  assert.deepEqual(extractFilePaths(null), []);
+});
+check('scanCandidateConflicts flags only top-3 candidates whose refs hit a touched file', () => {
+  const candidates = [
+    { task: { id: 'A', title: 'polish lib/select.mjs', notes: '' } },
+    { task: { id: 'B', title: 'unrelated work', notes: 'touch apps/admin/src/clean.ts' } },
+    { task: { id: 'C', title: 'edit functions/index.ts', notes: '' } },
+    { task: { id: 'D', title: 'lib/select.mjs again', notes: '' } }, // outside top-3 → ignored
+  ];
+  const touched = ['autopilot/lib/select.mjs', 'functions/index.ts'];
+  const r = scanCandidateConflicts(candidates, touched, { topN: 3 });
+  assert.equal(r.scanned, 3);
+  assert.equal(r.touchedCount, 2);
+  assert.deepEqual(r.conflicts.map((c) => c.id).sort(), ['A', 'C']); // B clean, D not scanned
+  assert.ok(r.conflicts.find((c) => c.id === 'A').files.includes('autopilot/lib/select.mjs'));
+});
+check('scanCandidateConflicts is a no-op when nothing is touched', () => {
+  const r = scanCandidateConflicts([{ task: { id: 'A', title: 'lib/x.mjs' } }], []);
+  assert.deepEqual(r, { conflicts: [], scanned: 0, touchedCount: 0 });
+  assert.equal(formatConflictWarning(r), '');
 });
 
 // ── prompts render with all placeholders supplied ─────────────────────────
