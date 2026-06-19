@@ -550,7 +550,10 @@ function buildTestRunCommand(testFilePath, repoRoot) {
     case 'vitest': return `npx vitest run ${f}`;
     case 'jest':   return `npx jest ${f}`;
     case 'mocha':  return `npx mocha ${f}`;
-    default:       return `node --test ${f}`; // native node:test
+    // tsx: TS/ESM project — node:test through the tsx loader so the test's TS imports actually load.
+    // --test-force-exit prevents a hang (and orphaned child processes) when a test leaves open handles.
+    case 'tsx':    return `npx tsx --test --test-force-exit ${f}`;
+    default:       return `node --test --test-force-exit ${f}`; // native node:test
   }
 }
 
@@ -1277,6 +1280,9 @@ async function runCycle(state) {
       PROFILE_RULES: WORKSPACE.profile.promptProfile || '',
       APPLICABLE_LESSONS,
       TEST_FILE_PATH: testFilePath || '',
+      // Exact runner command (correct runner for the repo + --test-force-exit) so the implementer
+      // doesn't guess a command that fails to load TS or hangs on open handles.
+      TEST_RUN_CMD: testFilePath ? buildTestRunCommand(testFilePath, GIT_ROOT) : '',
       // GREEN phase: the exact failing test the implementer must make pass (read from disk above).
       TEST_FILE_CONTENT: testFileContent || '',
       // GREEN phase revision: the real stack trace from the last test execution (empty on first attempt).
@@ -1963,6 +1969,10 @@ async function paceForWeeklyBudget(state) {
       cycles: 0, calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, costUsd: 0,
       externalTokenOffset: 0, calibratedAt: null, calibratedPct: null,
       calibratedResetAt: null, // cleared — the next reset is estimated; recalibrate from Claude.ai
+      // Clear the JSONL-derived measurement so the reader recomputes from the fresh windowStartedAt.
+      // Without this, the stale pre-reset count lingers and the governor sees a false "already spent X"
+      // at the start of every new window — the exact root cause of post-reset throttling.
+      measuredWeeklyTokens: 0, measuredAt: null,
     });
   }
 

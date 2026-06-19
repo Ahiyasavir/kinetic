@@ -46,7 +46,14 @@ export function detectTestRunner(repoRoot) {
   if (allDeps.mocha || /\bmocha\b/.test(testScript)) {
     return { runner: 'mocha', framework: 'mocha', command: 'npx mocha' };
   }
-  return { runner: 'node', framework: null, command: 'node --test' };
+  // tsx + node:test — a TypeScript/ESM project with no dedicated framework that runs the built-in
+  // node:test runner through the tsx loader (e.g. `tsx --test src/**/*.test.ts`). Plain `node --test`
+  // cannot load the project's TS imports, so the test would fail for a reason unrelated to the change.
+  // --test-force-exit prevents a hang when a test leaves open handles (timers/sockets).
+  if (allDeps.tsx || /\btsx\b/.test(testScript)) {
+    return { runner: 'tsx', framework: null, command: 'npx tsx --test --test-force-exit' };
+  }
+  return { runner: 'node', framework: null, command: 'node --test --test-force-exit' };
 }
 
 /**
@@ -80,13 +87,23 @@ import assert from 'node:assert/strict';
 // describe and it are Mocha globals — no import needed
 \`\`\``;
   }
+  if (runner === 'tsx') {
+    return `**Detected test runner: node:test via tsx (TypeScript/ESM)**
+Use \`node:test\` and \`node:assert/strict\`; import project source directly from its \`.ts\` files. Run with: \`${command}\`
+\`\`\`javascript
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+\`\`\`
+**Do NOT** open a live network/WhatsApp connection, start the daemon, or scan a QR in the test — inject/mock the socket factory so the test runs offline and exits. Always run with \`--test-force-exit\` so open handles can't hang the runner.`;
+  }
   // Default: native Node.js test runner (node:test)
   return `**Detected test runner: Node.js built-in (node:test)**
 No external test framework found. Use \`node:test\` and \`node:assert/strict\`. Run with: \`${command}\`
 \`\`\`javascript
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-\`\`\``;
+\`\`\`
+**Do NOT** leave open handles (timers, sockets, live connections) in the test; mock external I/O so the runner exits. The command already includes \`--test-force-exit\` as a safety net.`;
 }
 
 /**

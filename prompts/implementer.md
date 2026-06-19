@@ -27,8 +27,10 @@ build it.
 
 **You MUST:**
 1. **Read the test above** and implement exactly what it asserts — nothing more, nothing less.
-2. **Run the test** with the project's test command (e.g. `npm test -- {{TEST_FILE_PATH}}`, or the runner
-   the project uses) and iterate until it goes from RED to GREEN.
+2. **Run the test** with EXACTLY this command (it loads the project's TS/ESM correctly and force-exits so
+   open handles can't hang the run): `{{TEST_RUN_CMD}}` — iterate until it goes from RED to GREEN. Do NOT
+   start the daemon, open a live network/WhatsApp connection, or wait for a QR scan to verify; if the
+   behavior needs I/O, mock it so the test runs offline and exits.
 3. **Do NOT weaken, delete, skip, or rewrite the test** to force it green. The test is the contract; the
    code must satisfy it. (If a test is genuinely, provably wrong, do not edit it — explain in `notes` and
    implement the correct behavior; the reviewer arbitrates.)
