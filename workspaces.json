@@ -1,13 +1,13 @@
 {
   "_comment": "Workspace registry. Select at runtime with: node autopilot/cli.mjs --workspace <id> <command>. List with: node autopilot/cli.mjs workspaces. Omitting --workspace uses the DEFAULT workspace (config.json-derived, always available).",
-  "default": "wa-assistant",
+  "default": "rushpoint",
   "workspaces": [
     {
       "id": "rushpoint",
-      "label": "RushPoint — Race to Tzion",
-      "root": ".",
-      "branch": "topographic-maps",
-      "integrationBranch": "autopilot/topo",
+      "label": "RushPoint v2 — Creator + Play platform",
+      "root": "../Rushpoint-product",
+      "branch": "autopilot/product",
+      "integrationBranch": "autopilot/product",
       "baseBranch": "topographic-maps",
       "commitPrefix": "kinetic",
       "budgetScope": "rushpoint-kinetic-topo",
@@ -15,13 +15,14 @@
       "validation": {
         "commands": [
           { "name": "typecheck", "cmd": "npm run typecheck", "required": true, "timeoutMs": 600000 },
-          { "name": "build-admin", "cmd": "npm run build --workspace=apps/admin", "required": true, "timeoutMs": 600000 },
-          { "name": "lint", "cmd": "npm run lint", "required": false, "timeoutMs": 600000 }
+          { "name": "build-creator", "cmd": "npm run creator:build", "required": true, "timeoutMs": 600000 },
+          { "name": "build-play", "cmd": "npm run play:build", "required": false, "timeoutMs": 600000 },
+          { "name": "functions-build", "cmd": "npm run build --workspace=functions", "required": false, "timeoutMs": 600000 }
         ],
-        "lintRegressionGuard": true,
-        "e2e": { "enabled": false, "cmd": "node scripts/e2e-verify.mjs", "timeoutMs": 600000 }
+        "lintRegressionGuard": false,
+        "e2e": { "enabled": false, "cmd": "", "timeoutMs": 600000 }
       },
-      "boundaries": { "write": ["."], "read": ["."] }
+      "boundaries": { "write": ["apps", "functions", "packages", "scripts"], "read": ["."] }
     },
     {
       "id": "wa-assistant",

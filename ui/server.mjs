@@ -177,6 +177,8 @@ export async function handleRequest(req, res) {
           actualQuota: body.actualQuota != null ? Number(body.actualQuota) : undefined,
           tier: body.tier != null ? String(body.tier) : undefined,
           resetInMinutes: body.resetInMinutes != null ? Number(body.resetInMinutes) : undefined,
+          fiveHourPctUsed: body.fiveHourPctUsed != null ? Number(body.fiveHourPctUsed) : undefined,
+          fiveHourResetInMinutes: body.fiveHourResetInMinutes != null ? Number(body.fiveHourResetInMinutes) : undefined,
         });
         return send(res, 200, out);
       }

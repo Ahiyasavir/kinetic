@@ -56,7 +56,7 @@ import { ensureBreaker, isTripped, recordCycleOutcome, checkCostCeiling, tripBre
 import { classifyTask, reviewPolicy } from './lib/task-class.mjs';
 import { checkEvidence } from './lib/evidence.mjs';
 import { analyzeState, applyReconciliation, formatReport } from './lib/reconcile.mjs';
-import { governCycle, detectQuotaMode } from './lib/budget-governor.mjs';
+import { governCycle, detectQuotaMode, engineTrackedTokens, estimateNextCycleTokens } from './lib/budget-governor.mjs';
 import { getAdapter } from './lib/providers/index.mjs';
 import { getBestUsage, formatUsageReport } from './lib/usage-provider.mjs';
 import { measureUsage } from './lib/usage-reader.mjs';
@@ -2008,7 +2008,12 @@ async function paceForWeeklyBudget(state) {
     const remainingUsableTokens = Number.isFinite(gov.usable) ? Math.max(0, gov.usable - gov.spent) : Infinity;
     const tillResetMs = new Date(u.windowResetAt).getTime() - Date.now();
     const daysToReset = tillResetMs / 86400000;
-    const avgTokensPerCycle = u.cycles > 0 ? gov.spent / u.cycles : gov.estimate;
+    // Per-cycle cost from ENGINE-tracked tokens only — NOT gov.spent, which is the account-wide
+    // measured total (includes the user's interactive Claude sessions). Dividing the account-wide
+    // figure by engine cycles inflated avgTokensPerCycle ~10× and collapsed the cadence to ~4/day.
+    const engineTrackedForAvg = engineTrackedTokens(state);
+    const avgTokensPerCycle = u.cycles > 0 && engineTrackedForAvg > 0
+      ? engineTrackedForAvg / u.cycles : gov.estimate;
     const adaptivePerDay = computeAdaptiveCyclesPerDay({
       remainingUsableTokens, daysToReset, avgTokensPerCycle,
       floorPerDay: ac.minPerDay ?? 4,
@@ -2049,7 +2054,30 @@ async function paceForWeeklyBudget(state) {
     u.adaptiveIntervalMs = Math.max(ADAPTIVE_MIN_MS, Math.round(u.adaptiveIntervalMs * 0.5));
   }
   const effectiveAdaptiveMs = healthyUnderBudget ? ADAPTIVE_MIN_MS : (u.adaptiveIntervalMs || ADAPTIVE_INITIAL_MS);
-  const minSpacingMs = Math.max(legacySpacingMs, effectiveAdaptiveMs);
+  let minSpacingMs = Math.max(legacySpacingMs, effectiveAdaptiveMs);
+
+  // PROACTIVE 5-HOUR GUARD. On Pro/Max the rolling 5-hour session limit is usually the BINDING
+  // constraint (it caps well below the weekly quota). The engine otherwise only reacts to it AFTER a
+  // 429. When the user has calibrated the 5-hour quota (state.usage.calibratedFiveHourQuota), check
+  // whether the NEXT cycle's estimated tokens would breach the 5-hour usable budget; if so, hold until
+  // the 5-hour window resets rather than burning into a rate-limit. No-op when the 5-hour quota is
+  // uncalibrated (calibratedFiveHourQuota absent) — fully backward compatible.
+  const fhQuota = Number(u.calibratedFiveHourQuota) || 0;
+  const m5 = u.measuredFiveHour || {};
+  const fhSpent = Number(m5.tokens) || 0;
+  const fhResetAtMs = Number(m5.resetAtMs) || 0;
+  if (fhQuota > 0 && fhResetAtMs > Date.now()) {
+    const fhUsable = fhQuota * 0.95; // small reserve so we don't tip the limit exactly
+    const estPerCycle = estimateNextCycleTokens(state, config);
+    if (fhSpent + estPerCycle > fhUsable) {
+      const fhWaitMs = fhResetAtMs - Date.now() + 60000; // +1 min cushion past the reset
+      if (fhWaitMs > minSpacingMs) {
+        log(`5-hour guard: ${Math.round(fhSpent / 1000)}k/${Math.round(fhQuota / 1000)}k tok used (next cycle ~${Math.round(estPerCycle / 1000)}k would breach 95%) — holding ${Math.round(fhWaitMs / 60000)} min until the 5-hour window resets.`);
+        minSpacingMs = fhWaitMs;
+      }
+    }
+  }
+
   if (u.lastCycleAt) {
     const tillReset = new Date(u.windowResetAt).getTime() - Date.now();
     let waitMs = Math.min(minSpacingMs - (Date.now() - new Date(u.lastCycleAt).getTime()), Math.max(0, tillReset));

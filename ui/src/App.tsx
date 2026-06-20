@@ -171,6 +171,9 @@ export default function App(): JSX.Element {
   const [calibResetHr, setCalibResetHr] = useState('');
   const [calibResetMin, setCalibResetMin] = useState('');
   const [calibTier, setCalibTier] = useState('pro');
+  const [calib5hPct, setCalib5hPct] = useState('');
+  const [calib5hResetHr, setCalib5hResetHr] = useState('');
+  const [calib5hResetMin, setCalib5hResetMin] = useState('');
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const logTailRef = useRef<HTMLDivElement>(null);
 
@@ -256,9 +259,16 @@ export default function App(): JSX.Element {
     try {
       const body: Record<string, unknown> = { ws: wsId, pctUsed: pct, tier: calibTier || 'pro' };
       if (resetInMinutes > 0) body.resetInMinutes = resetInMinutes;
+      // Optional 5-hour (session) calibration — the binding constraint on Pro/Max.
+      const fhPct = parseFloat(calib5hPct);
+      if (!isNaN(fhPct) && fhPct > 0 && fhPct <= 100) body.fiveHourPctUsed = fhPct;
+      const fhHr = parseInt(calib5hResetHr || '0', 10);
+      const fhMin = parseInt(calib5hResetMin || '0', 10);
+      const fhReset = (isNaN(fhHr) ? 0 : fhHr) * 60 + (isNaN(fhMin) ? 0 : fhMin);
+      if (fhReset > 0) body.fiveHourResetInMinutes = fhReset;
       const r = await fetch('/api/calibrate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
       if (!r.ok) { const d = await r.json().catch(() => ({})); flash(t.calibrateErr + ': ' + (d.error || r.status)); }
-      else { flash(t.calibrateDone); setShowCalibrate(false); setCalibPct(''); setCalibResetHr(''); setCalibResetMin(''); await poll(); }
+      else { flash(t.calibrateDone); setShowCalibrate(false); setCalibPct(''); setCalibResetHr(''); setCalibResetMin(''); setCalib5hPct(''); setCalib5hResetHr(''); setCalib5hResetMin(''); await poll(); }
     } catch { flash(t.calibrateErr); } finally { setBusy(false); }
   }
 
