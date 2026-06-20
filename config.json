@@ -109,7 +109,7 @@
       "reliability": 1, "structure": 0
     },
     "minProductShare": 0.7,
-    "minProductTasks": 5,
+    "minProductTasks": 1,
     "maxAttemptsBeforeBlock": 3,
     "maxReviewFailAttempts": 2,
     "lessonMatchThreshold": 0.35,
@@ -223,9 +223,11 @@
     "_comment": "Decoupled engine telemetry (U-36), resolved by autopilot/config-loader.mjs → { telemetry } and consumed by autopilot/lib/telemetry.mjs. Reports the AUTOPILOT ENGINE's own health/metrics (cycle duration, token count, error count, an event log) INDEPENDENTLY of the RushPoint product — supervisor.mjs + watchdog.mjs emit events at startup / cycle-start / cycle-end / on-error. State persists in state.json under framework.telemetry (separate from the app tier). `enabled:false` makes every recorder a no-op (disable without touching supervisor logic); set `endpoint` to a monitoring URL to batch events out, else they buffer locally. Omit this whole block to default to disabled (backward compatible)."
   },
   "git": {
-    "integrationBranch": "autopilot/topo",
+    "integrationBranch": "autopilot/product",
     "baseBranch": "topographic-maps",
     "commitPrefix": "kinetic",
+    "repository": "../Rushpoint-product",
+    "branch": "autopilot/product",
     "_comment": "Git target (U-35), resolved by autopilot/lib/git-config-loader.mjs → resolveGitConfig(). The engine drives THIS repo/branch. integrationBranch = the branch all reviewed work lands on; baseBranch = where it forks from; commitPrefix = the auto-commit message prefix. THREE OPTIONAL fields make the engine portable to any external repo: `repository` (path to the target repo, relative to the autopilot/ parent or absolute — default '.', the repo the kinetic lives in), `branch` (the active branch — default = integrationBranch), and `worktreeName` (manage the target in a dedicated git worktree placed as a sibling of `repository` — default absent = operate in-place). Omit all three (as here) to keep the current RushPoint in-place layout (fully backward compatible). The watchdog initializes/creates any configured worktree on startup and passes the resolved working-tree root to the supervisor via KINETIC_GIT_ROOT. See autopilot/docs/git-config.md."
   },
   "disableDependencyOptimization": false,
