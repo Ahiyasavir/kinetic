@@ -226,8 +226,6 @@
     "integrationBranch": "autopilot/product",
     "baseBranch": "topographic-maps",
     "commitPrefix": "kinetic",
-    "repository": "../Rushpoint-product",
-    "branch": "autopilot/product",
     "_comment": "Git target (U-35), resolved by autopilot/lib/git-config-loader.mjs → resolveGitConfig(). The engine drives THIS repo/branch. integrationBranch = the branch all reviewed work lands on; baseBranch = where it forks from; commitPrefix = the auto-commit message prefix. THREE OPTIONAL fields make the engine portable to any external repo: `repository` (path to the target repo, relative to the autopilot/ parent or absolute — default '.', the repo the kinetic lives in), `branch` (the active branch — default = integrationBranch), and `worktreeName` (manage the target in a dedicated git worktree placed as a sibling of `repository` — default absent = operate in-place). Omit all three (as here) to keep the current RushPoint in-place layout (fully backward compatible). The watchdog initializes/creates any configured worktree on startup and passes the resolved working-tree root to the supervisor via KINETIC_GIT_ROOT. See autopilot/docs/git-config.md."
   },
   "disableDependencyOptimization": false,
