@@ -174,7 +174,11 @@ const STOP_FLAG = WORKSPACE.queuePaths.stopFlag;
 // the prompt instructions track a customized handoffDir (defaults to 'autopilot/state/handoff'). The
 // basename is context-tagged (U-34, lib/handoff-paths.mjs) so concurrent project contexts that share a
 // handoff dir never collide — and it matches what core's readHandoff (resolveName) reads back.
-const handoffRel = (file) => path.join(path.relative(REPO_ROOT, HANDOFF_DIR), contextualName(file)).replaceAll('\\', '/');
+// NOTE: the path the Claude agent writes to is resolved against ITS cwd, which is GIT_ROOT (the target
+// repo), not REPO_ROOT (the engine repo). For the in-place layout GIT_ROOT === REPO_ROOT so this is a
+// no-op; for an EXTERNAL target (workspace root ≠ engine repo) the handoff must be addressed relative to
+// GIT_ROOT or the agent writes to the wrong place and the engine reads an empty handoffDir ("no task").
+const handoffRel = (file) => path.join(path.relative(GIT_ROOT, HANDOFF_DIR), contextualName(file)).replaceAll('\\', '/');
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 // Read the engine config up front. A missing/unreadable config is an ENGINE fault (a missing local code
